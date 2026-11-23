@@ -9,7 +9,7 @@ version = "0.1.0"
 description = "Thermal scattering law uncertainty Analysis using RAndom files"
 readme = "README.md"
 requires-python = ">=3.13"
-license = {text = "MIT"}
+license = {text = "Apache-2.0"}
 
 # These are your core requirements (formerly requirements.txt)
 dependencies = [

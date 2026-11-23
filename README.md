@@ -4,14 +4,14 @@
 
 # TARA: Thermal Scattering Law Uncertainty Analysis
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python Version](https://img.shields.io/badge/python-3.13%2B-blue)](https://www.python.org/)
 
 **TARA** (Thermal scattering law uncertainty Analysis using RAndom files) is a robust computational framework developed for the uncertainty quantification (UQ) of thermal neutron scattering laws. 
 
 Designed for the nuclear data and reactor physics community, TARA utilizes stochastic sampling to generate physically consistent randomized thermal scattering files. By applying mathematically rigorous perturbations to amplitude and peak positions, the code allows researchers to propagate continuous-energy thermal scattering uncertainties into downstream Monte Carlo or deterministic transport solvers.
 
-📖 **[Access the official TARA Documentation here.](docs/index.md)**
+[TARA documentation](docs/index.md) · [Upstream repository](https://github.com/vaibhavjaiswal-asnr/TARA)
 
 ---
 
@@ -91,15 +91,15 @@ Pytest reports which tests were skipped and why. Tests that run real NJOY or opt
 
 ## Contributing
 
-Open an issue to discuss a proposed change, then submit a pull request describing the approach and the tests that cover it.
+Use [TARA Issues](https://github.com/vaibhavjaiswal-asnr/TARA/issues) to report a problem or discuss a change. To contribute, push the branch to your fork (`origin`). Then open a [pull request in upstream TARA](https://github.com/vaibhavjaiswal-asnr/TARA/pulls) using **Compare across forks**. Choose the intended upstream branch as the base and the branch in your fork as the compare branch. Describe the change and the tests that cover it.
 
-## Extending the Framework (Developer Guides)
+Use paths relative to this README for files stored in the repository, such as `docs/index.md` and `application/APP_INTEGRATION_GUIDE.md`. On GitHub, these links open the file on the branch and repository you are viewing. Use full upstream URLs for shared project pages such as Issues and Pull Requests.
+
+## Developer Guides: Extending the Framework
 
 This framework is built on a strict domain-driven architecture. We isolate execution, file I/O, mathematical sampling, and application logic into distinct boundaries. 
 
-If you want to add new features, file formats, or backends, **do not modify the core physics or sampling algorithms.** Instead, follow the strict protocols outlined in our integration guides. 
-
-These guides are specifically written to act as **System Prompts for AI Assistants (like ChatGPT, Claude, or Gemini)**. You can copy the raw text of any guide, paste it into an LLM, and it will generate the perfectly formatted boilerplate code required for your addition.
+If you want to add new features, file formats, or backends, **do not modify the core physics or sampling algorithms.** Instead, follow the strict protocols outlined in our integration guides: 
 
 *   **[Core Integration Guide](./core/CORE_INTEGRATION_GUIDE.md):** Read this if you are adding new data schemas (`PhononSpectra`), mathematical smoothers, or new topological sampling strategies to the TARA engine.
 *   **[Input/Output Integration Guide](./input_output/IO_INTEGRATION_GUIDE.md):** Read this if you are adding support for a new third-party file format (e.g., VASP, GROMACS, custom JSON). 
