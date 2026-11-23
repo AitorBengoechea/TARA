@@ -1,0 +1,13 @@
+repos:
+  - repo: local
+    hooks:
+      - id: generate-project-map
+        name: Generate Project Map
+        entry: python generate_ai_context.py
+        language: system
+        pass_filenames: false
+      - id: generate-test-overview
+        name: Generate Test Overview
+        entry: python tests/generate_test_overview.py
+        language: system
+        pass_filenames: false

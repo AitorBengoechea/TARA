@@ -1,0 +1,54 @@
+[build-system]
+# This tells Python to use the modern setuptools backend
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tara"
+version = "0.1.0"
+description = "Thermal scattering law uncertainty Analysis using RAndom files"
+readme = "README.md"
+requires-python = ">=3.13"
+license = {text = "MIT"}
+
+# These are your core requirements (formerly requirements.txt)
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "joblib",
+    "spglib",
+    "ncrystal>=4.0",
+    "ncrystal-plugin-Liquids @ git+https://github.com/dddijulio/ncrystal-plugin-Liquids.git",
+    "endf-parserpy",
+    "numba",
+    "scikit-learn",
+    "tables"
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+liquids = [
+    "ncrystal-plugin-Liquids @ git+https://github.com/dddijulio/ncrystal-plugin-Liquids.git",
+]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -v"
+testpaths = ["tests"]
+markers = [
+    "integration: marks tests as requiring external binaries or heavy file I/O",
+]
+
+[tool.setuptools.packages.find]
+# Tells the build system to include these specific top-level domains
+include = [
+    "input_output*",
+    "core*",
+    "processing*",
+    "analyzer*",
+    "application*"
+]
+
+[project.scripts]
+tara-update-docs = "application.cli:update_docs"

@@ -1,0 +1,17 @@
+site_name: TARA Documentation
+theme:
+  name: material
+
+nav:
+  - Home: index.md
+  - Background & Motivation: sections/background.md
+  - 1. Sampling Methodology: sections/sampling-methodology.md
+  - 2. Amplitude Sampling: sections/amplitude-sampling.md
+  - 3. Peak Position Sampling: sections/peak-position-sampling.md
+  - 4. Amplitude and Peak Shifting: sections/amplitude-peak-shifting.md
+  - User Configuration: sections/user-configuration.md
+  - 5. Topological Filtering: sections/topological-filtering.md
+  - Liquid Materials:
+      - Translation Sampling: sections/translation-sampling.md
+      - ACE Generation: sections/liquid-material-ace.md
+      - NCrystal Liquids: sections/ncrystal-liquids-v2.md

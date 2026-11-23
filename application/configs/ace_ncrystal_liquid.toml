@@ -1,0 +1,50 @@
+# Hydrogen in liquid water via the NCrystal Liquids plugin and NJOY. Relative file paths start at this TOML directory.
+
+[workflow]
+backend = "ncrystal"
+
+[material]
+base_endf_file = "../../tests/fixtures/n_1-H-001g.jeff"
+ncmat_file = "../../tests/fixtures/liquid_water_295K_illustrative.ncmat"
+atom_label = "H"
+elastic_mode = "none"
+temperature_k = 295.0  # Matches the NCMAT fixture.
+state = "liquid"
+
+[output]
+directory = "../../tara_output/ace_ncrystal/cli_liquid"
+
+[ensemble]
+n_samples = 3
+include_reference = true
+random_seed = 20261008
+batch_size = 512
+
+[execution]
+n_jobs = 1
+njoy_executable = "njoy"
+
+[sampling]
+max_energy_shift_mev = 1.0
+max_amplitude_shift_pct = 3.0
+grid_partition_method = "automatic"
+automatic_partition_prominence_pct = 1.0
+manual_energy_ranges = []
+domain_splitting_strategy = "fixed"
+correlation_strategy = "independent"
+variable_coupling = "independent"
+shared_grid_structure = true
+freeze_origin = true
+fast_amplitude = true
+amplitude_method = "fast"
+spatial_method = "diffeomorphic"
+auto_normalize = true
+
+[ace]
+max_energy_ev = 5.0
+suffix = ".01"
+nbin = 16
+tolerance = 0.001
+save_xsdir = true
+mti = 222  # NJOY inelastic MT for this H(H2O) workflow.
+mte = 0    # No separate elastic thermal reaction for this model.
