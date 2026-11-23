@@ -7,8 +7,10 @@ from typing import List, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from core.config import TaraConfig
+from core.config import TaraConfig, VibrationSamplingConfig
 from core.data.input_pdos import PhononSpectra
+from core.data.material_ensemble import MaterialEnsemble
+from core.data.material_scattering import MaterialScatteringModel
 from core.data.spectra_batch import PerturbationBatch, SpectrumBatch
 from core.data.spectra_ensemble import (
     EnsembleGeneration,
@@ -16,6 +18,7 @@ from core.data.spectra_ensemble import (
     SpectraEnsemble,
 )
 from core.sampler.correlation_engine import get_correlation_strategy
+from core.sampler.diffusion_sampler import DiffusionSampler
 from core.sampler.parameter_space import ParameterSpaceSampler
 from core.sampler.domain_partitioner import DomainPartitioner
 from core.sampler.topology_strategy import get_topology_strategy
@@ -37,7 +40,7 @@ from core.math_engine.segment_translation import (
 )
 
 
-class TaraSampler:
+class VibrationSampler:
     """
     Execute the stochastic sampling pipeline for phonon spectra.
 
@@ -47,11 +50,11 @@ class TaraSampler:
 
     Parameters
     ----------
-    config : TaraConfig
-        Validated global configuration object.
+    config : VibrationSamplingConfig
+        Validated vibrational configuration.
     spectra : PhononSpectra
         Baseline phonon density of states.
-    amplitude_method : {"precise", "fast"}, default="precise"
+    amplitude_method : {"precise", "fast"}, default="fast"
         Amplitude perturbation method. ``"precise"`` uses the constrained
         B-spline implementation, while ``"fast"`` uses direct domain scaling.
     spatial_method : {"diffeomorphic", "crossfade"}, default="diffeomorphic"
@@ -61,7 +64,7 @@ class TaraSampler:
 
     Attributes
     ----------
-    config : TaraConfig
+    config : VibrationSamplingConfig
         Validated user configuration constraints.
     base_spectra : PhononSpectra
         Standardized baseline phonon spectrum.
@@ -83,18 +86,18 @@ class TaraSampler:
 
     def __init__(
         self,
-        config: TaraConfig,
+        config: VibrationSamplingConfig,
         spectra: PhononSpectra,
         amplitude_method: str = "fast",
         spatial_method: str = "diffeomorphic",
     ) -> None:
         """
-        Initialize the TARA sampler.
+        Initialize the vibrational sampler.
 
         Parameters
         ----------
-        config : TaraConfig
-            Validated global configuration object.
+        config : VibrationSamplingConfig
+            Validated vibrational configuration.
         spectra : PhononSpectra
             Baseline phonon density of states.
         amplitude_method : {"precise", "fast"}, default="fast"
@@ -1103,3 +1106,103 @@ class TaraSampler:
             new_series,
             auto_normalize=auto_normalize,
         )
+
+
+class TaraSampler:
+    """Generate a vibrational, translational, or joint sampling ensemble.
+
+    Parameters
+    ----------
+    config : TaraConfig
+        Vibrational bounds and optional diffusion settings.
+    spectra : PhononSpectra, optional
+        Explicit vibrational reference. When omitted, use the continuous
+        spectrum of ``material``.
+    amplitude_method : {"precise", "fast"}, default="fast"
+        Amplitude perturbation method for vibration sampling.
+    spatial_method : {"diffeomorphic", "crossfade"}, default="diffeomorphic"
+        Spatial perturbation method for vibration sampling.
+    material : MaterialScatteringModel, optional
+        Reference material. An Egelstaff--Schofield liquid is required when
+        diffusion sampling is enabled.
+    """
+
+    def __init__(
+        self,
+        config: TaraConfig,
+        spectra: PhononSpectra | None = None,
+        amplitude_method: str = "fast",
+        spatial_method: str = "diffeomorphic",
+        *,
+        material: MaterialScatteringModel | None = None,
+    ) -> None:
+        self.config = config
+        self._diffusion_sampler = None
+        self._vibration_sampler = None
+
+        if config.diffusion_enabled:
+            if material is None:
+                raise ValueError("Diffusion sampling requires a reference material.")
+            seed = config.random_seed
+            if config.sampling_method == "monte_carlo":
+                # Use the historical ACE diffusion stream independently of VDOS draws.
+                seed = int(np.random.SeedSequence([seed, 0xD1FF]).generate_state(1)[0])
+            self._diffusion_sampler = DiffusionSampler(
+                material, config.diffusion, seed=seed, sampling_method=config.sampling_method,
+            )
+
+        if config.vibration_enabled:
+            if spectra is None:
+                if material is None:
+                    raise ValueError("Vibration sampling requires a reference spectrum or material.")
+                spectra = material.dynamics.continuous
+            self._vibration_sampler = VibrationSampler(
+                config, spectra, amplitude_method, spatial_method,
+            )
+
+    def __getattr__(self, name: str):
+        """Preserve access to vibration diagnostics on existing sampler instances."""
+        vibration = object.__getattribute__(self, "_vibration_sampler")
+        if vibration is None:
+            raise AttributeError(name)
+        return getattr(vibration, name)
+
+    def generate_preview(self) -> SpectraEnsemble:
+        """Return deterministic extrema for the configured vibration bounds.
+
+        Returns
+        -------
+        SpectraEnsemble
+            The vibrational reference and preview spectra.
+
+        Raises
+        ------
+        ValueError
+            If vibrational perturbations are inactive.
+        """
+        if self._vibration_sampler is None:
+            raise ValueError("A preview requires active vibrational perturbations.")
+        return self._vibration_sampler.generate_preview()
+
+    def generate_ensemble(self, batch_size: int = 512) -> SpectraEnsemble | MaterialEnsemble:
+        """Generate and return all stochastic samples for this experiment.
+
+        Parameters
+        ----------
+        batch_size : int, default=512
+            Maximum number of spectra evaluated together during vibration sampling.
+
+        Returns
+        -------
+        SpectraEnsemble or MaterialEnsemble
+            The reference and samples. With diffusion enabled, each material
+            realization uses the matching vibrational sample when available.
+        """
+        spectra_ensemble = None
+        if self._vibration_sampler is not None:
+            spectra_ensemble = self._vibration_sampler.generate_ensemble(batch_size=batch_size)
+        if self._diffusion_sampler is not None:
+            return self._diffusion_sampler.generate_ensemble(
+                self.config.n_samples, spectra_ensemble=spectra_ensemble,
+            )
+        return spectra_ensemble

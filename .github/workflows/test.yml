@@ -1,0 +1,61 @@
+name: TARA tests
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest (Ubuntu, Python 3.13)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install NJOY build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cmake gfortran
+
+      - name: Build NJOY2016 from source
+        # Build instructions: https://docs.njoy21.io/install.html
+        run: |
+          njoy_source="$RUNNER_TEMP/njoy2016"
+          njoy_build="$RUNNER_TEMP/njoy-build"
+          git clone --depth 1 --branch 2016.78 https://github.com/njoy/NJOY2016.git "$njoy_source"
+          cmake -S "$njoy_source" -B "$njoy_build" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$njoy_build" --parallel 2
+          test -x "$njoy_build/njoy"
+          echo "$njoy_build" >> "$GITHUB_PATH"
+          printf 'TARA_NJOY_EXEC=%s\n' "$njoy_build/njoy" >> "$GITHUB_ENV"
+
+      - name: Install TARA and test dependencies
+        run: python -m pip install ".[test]"
+
+      - name: Run a native LEAPR smoke test
+        # Use the checked-in deck so CI can exercise NJOY without patching pytest files.
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          from processing.backends.njoy_processor import NjoyProcessor
+
+          deck = Path("tests/fixtures/input_2.leapr").read_text(encoding="ascii")
+          with TemporaryDirectory() as directory:
+              output = Path(directory) / "graphite.endf"
+              processor = NjoyProcessor(njoy_exec=os.environ["TARA_NJOY_EXEC"], temp_dir=directory)
+              processor.execute_leapr(deck, str(output))
+              if not output.is_file() or output.stat().st_size == 0:
+                  raise RuntimeError("NJOY LEAPR produced no thermal scattering table")
+          PY
+
+      - name: Run tests
+        run: python -m pytest -ra

@@ -170,8 +170,9 @@ Only explicit `enabled=true` selects `MaterialEnsemble` in NJOY liquid runs.
 Supported modes are `diffusivity_only`, `weight_fixed_d`, and
 `joint_independent`. Bounds are sensitivity percentages, not experimentally
 calibrated uncertainty intervals. Weight variation requires explicit
-`weight_compensation="continuous_only"`. VDOS sampling can independently be
-active or disabled; translation-only runs bypass the VDOS `TaraConfig`.
+`weight_compensation="continuous_only"`. `TaraConfig` receives both sets of
+bounds, and `TaraSampler` selects translation-only sampling when both VDOS
+bounds are zero.
 Per-sample physical parameters are included in the successful-run manifest
 for active material ensembles.
 
@@ -203,9 +204,8 @@ For an NJOY liquid with `[diffusion_sampling].enabled = true`,
 `_prepare_diffusion_ensemble()` uses the **same design method**. If VDOS
 sampling is active, diffusion uses the same sub-ensemble index ranges and
 sample indices as the spectral blocks; it has independently stratified named
-parameter streams. If VDOS sampling is inactive, diffusion alone receives one
-N-row design, without creating an invalid all-zero `TaraConfig`. No diffusion
-sampling occurs if its section is disabled or absent.
+parameter streams. If VDOS sampling is inactive, diffusion receives one
+design with `n_samples` rows.
 
 `random_seed` identifies the experimental design and is stored, together with
 `sampling_method`, in `run_manifest.json`. The manifest also records topology

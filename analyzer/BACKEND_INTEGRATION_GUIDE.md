@@ -4,12 +4,11 @@
 
 The `analyzer` domain is an optional downstream analysis layer. It composes Core data models with reusable backend-execution capabilities from Processing, while owning only analysis-specific adaptation, in-memory state, extraction, mathematics, and ensemble aggregation.
 
-This framework strictly decouples:
- **Execution** (owned by reusable Processing backends), **State** (Analyzer engines), **Extraction** (Analyzer parsers), and **Mathematics** (Analyzer physics utilities).
+This framework strictly decouples **Execution** (owned by reusable Processing backends), **State** (Analyzer engines), **Extraction** (Analyzer parsers), and **Mathematics** (Analyzer physics utilities).
 
 If you are adding a new nuclear data backend (e.g., FLASSH, FRENDY, ACE-generators), you **do not need to write any physical mathematics**. Multi-incident-energy integrations, Dynamic Structure Factors, and Thermodynamic integrations are mathematically universal and already implemented.
 
-Your sole responsibility is to build the "Bridge" connecting your specific backend to our universal schema. The Analyzer adapter normally has three parts:
+Your sole responsibility is to build the "Bridge" connecting your specific backend to our universal schema. This requires exactly three files:
 
 1. **The Engine** (`analyzer/backends/<name>_engine.py`)
 2. **The Runner** (`analyzer/runners/<name>_runner.py`)
@@ -20,10 +19,8 @@ Your sole responsibility is to build the "Bridge" connecting your specific backe
 ## 2. Step 1: The Engine (State Container)
 
 **Goal:** Prevent redundant disk I/O and maintain memory states between execution and parsing.
-
 **Location:** `analyzer/backends/<name>_engine.py`
 
-**Function:**
 The Engine is a simple Python `@dataclass`. It receives the raw output from the Runner, loads any necessary files into RAM (as Python dictionaries, trees, or C++ pointers), and holds them so the Parser can read them instantly without touching the hard drive.
 
 **Required Structure:**
@@ -37,10 +34,8 @@ The Engine is a simple Python `@dataclass`. It receives the raw output from the 
 ## 3. Step 2: The Runner (Execution Adapter)
 
 **Goal:** Adapt an Analyzer request to reusable Processing execution primitives and return a loaded Engine.
-
 **Location:** `analyzer/runners/<name>_runner.py`
 
-**Function:**
 The Runner is a thin adapter. It may select Processing deck builders, provide Analyzer-specific execution parameters, and load transient backend outputs into an Engine. It must not duplicate subprocess execution, sandbox management, or backend deck syntax already owned by `processing.backends` and `processing.deck_builders`.
 
 **Required Structure:**
@@ -48,7 +43,7 @@ The Runner is a thin adapter. It may select Processing deck builders, provide An
 * Must inherit from `analyzer.core_interfaces.BaseRunner`.
 * May depend on `processing.backends` and `processing.deck_builders`.
 * Must not depend on `processing.orchestrators` or `processing.pipelines`; Analyzer retains ownership of ensemble iteration, parallelism, sample identity, and aggregation.
-* **`execute(self, sample_index: int, spectrum: PhononSpectra, **kwargs)`**:
+* **`execute(self, sample_index: int, spectrum, **kwargs)`**:
 1. Translate Analyzer parameters into calls to reusable Processing deck/execution primitives.
 2. Keep backend files transient unless the backend contract requires otherwise.
 3. Load generated backend outputs into RAM while the Processing sandbox is alive.
@@ -62,26 +57,43 @@ The Runner is a thin adapter. It may select Processing deck builders, provide An
 
 ---
 
+### Vibrational and material inputs
+
+Pass a `SpectraEnsemble` to Analyzer for vibrational sampling, or a
+`MaterialEnsemble` for translation-only or joint liquid sampling. The sample
+and independent reference use the same public `NjoyRunner` or `NCrystalRunner`.
+Each public runner delegates by input type to a private vibration or translation
+runner. Both paths return the same engine type to the existing backend parser.
+
+The liquid material path uses the composition and model layout of the selected
+backend template. NJOY serializes the complete realization into the LEAPR input.
+NCrystal updates the selected species' translation settings and writes the
+sampled VDOS when it differs from the source. Processing owns both operations.
+
+NCrystal evaluates whole-material cross sections natively. When an Analyzer
+request needs a liquid kernel for differential quantities, or an active-species
+selection needs component scattering, the public runner prepares the existing
+capture adapter before workers start. Set `calc_thermodynamics=False` in parser
+options when a study needs cross sections without thermodynamic observables.
+
 ## 4. Step 3: The Parser (Extraction Adapter)
 
 **Goal:** Extract data from the Engine and funnel it into the universal mathematical schemas.
-
 **Location:** `analyzer/parsers/<name>_parser.py`
 
-**Function:**
 The Parser receives the `Engine` and performs **zero file I/O**. It simply navigates the RAM-loaded objects and maps them to the `PhysicsData` schema.
 
 **Required Structure:**
 
 * Must inherit from `analyzer.parsers.base_tsl_parser.BaseTslParser`.
 * Must implement `parse(self, sample_index: int, engine: <Name>Engine, **kwargs) -> PhysicsData`.
-* The `parse` method orchestrates three private methods:
-1. **`_extract_thermodynamics(self, engine)`** populates `ThermodynamicsData`. Use the shared PDOS integrals in `analyzer.physics.thermodynamics` for calculated scalars and record the scope of any native quantities. For example, NCrystal supplies native effective temperature and displacement information for the supported solid path.
-2. **`_extract_cross_sections(self, engine, integ, **kwargs)`** populates `IntegralData` with the requested channels. Use the backend's grid contract. NJOY tabulations can be interpolated onto a requested grid. For captured NCrystal liquid cross sections, the Runner and Parser use the same explicit grid.
+* The `parse` method must orchestrate three private methods:
+1. **`_extract_thermodynamics(self, engine)`**: Extracts or calculates scalar properties. *Mandatory Rule:* Use the pre-built Numba kernels in `analyzer.physics.thermodynamics` (e.g., `calc_cv_numba(pdos, E, temp)`) to ensure backend-agnostic consistency. Returns a `ThermodynamicsData` object.
+2. **`_extract_cross_sections(self, engine, integ, **kwargs)`**: Navigates the engine's memory to extract 1D integrated cross-sections (Total, Inelastic, Elastic). Interpolates them onto the target `energy_grid` and populates the `integ: IntegralData` object.
 3. **`_extract_kinematics(self, engine, diff, integ, **kwargs)`**:
 * Navigates the engine's memory to extract the $\alpha$ grid, $\beta$ grid, and the Thermal Scattering Law matrix values.
 * Formats these strictly into a Pandas DataFrame: `sab_df = pd.DataFrame(sab_matrix, index=alpha_grid, columns=beta_grid)`.
-* Pass the backend-normalized table to the shared kinematics using: `self._apply_universal_kinematics(sab_df, diff, integ, temp, mass_amu, **kwargs)`. The parent class handles all the multi-$E_{in}$ loops, angular distributions, and ratios automatically.
+* *The Magic Handoff:* Once `sab_df` is built, immediately pass it to the parent class by calling: `self._apply_universal_kinematics(sab_df, diff, integ, temp, mass_amu, **kwargs)`. The parent class handles all the multi-$E_{in}$ loops, angular distributions, and ratios automatically.
 
 
 
@@ -104,20 +116,17 @@ Based on the exact rules, constraints, and class hierarchies defined in the guid
 Please use standard placeholder logic (like `pass` or basic dictionary navigation) for the highly specific backend file-reading, but ensure the structural interfaces, kwargs passing, and typing exactly match the framework's requirements."
 ---
 
-## 6. Backend contracts
+## 6. Backend Symmetry: NCrystal and NJOY
 
-The two backends share the Runner, Engine, and Parser interfaces. Their
-scattering representations and source grids are backend specific.
+Analyzer keeps the same three-part structure for every backend:
 
 
 ## NCrystal source-spaced kernel handoff
 
-The intended solid handoff provides the full Core spectrum in
-`NCrystalEngine.energy_grid` and `.pdos`. NCrystal's direct VDOS kernel
-functions (`extractGn` and `extractKnl`) use the NCMAT-compatible arrays from
-Processing when `.backend_energy_grid` and `.backend_pdos` are supplied.
-The [Processing guide](../processing/PROCESSING_INTEGRATION_GUIDE.md)
-records the still-open transient-state regression for this handoff.
+`NCrystalEngine.energy_grid` and `.pdos` preserve the full Core spectrum for
+thermodynamic integrations. NCrystal's direct VDOS kernel functions (`extractGn`
+and `extractKnl`) instead consume `.backend_energy_grid` and `.backend_pdos`,
+forwarded from the original, atom-specific NCMAT serializer in Processing.
 This avoids reintroducing Core's artificially fine Debye spacing or `E=0` in
 the NCrystal VDOS-to-kernel API. The parser validates but never resamples this
 format-specific grid or performs file I/O. Manually constructed engines without
@@ -142,11 +151,7 @@ retained unchanged. Preserve all native coordinates and do not interpolate,
 sort, merge or re-apply detailed balance. The generic `canonicalize_sab()`
 is deliberately kept backward-compatible for non-MF7 callers.
 
-Use the original LEAPR template with `NjoyRunner` for discrete-mode
-provenance. `EnsembleAnalyzer.compute(..., runner_kwargs={"export_full_spectra": True})`
-opts into the full continuous LEAPR table. Native discrete-mode export is
-the default. See the [LEAPR I/O guide](../input_output/IO_INTEGRATION_GUIDE.md)
-and the [MF7 decoder tests](../tests/test_analyzer/test_njoy_mf7_representation.py).
+Tests: `tests/test_analyzer/test_njoy_mf7_representation.py`.
 
 ## Captured NCrystal liquid kernels
 
@@ -155,11 +160,12 @@ and the [MF7 decoder tests](../tests/test_analyzer/test_njoy_mf7_representation.
 This path does not construct `NuclearData`, run `ncmat2endf`, or regenerate the
 liquid scattering law with `extractKnl(vdos=...)`.
 
-The liquid backend builds a temporary capture adapter automatically when
-the runner is constructed. Supply `NCrystalRunner(liquid_capture_library=...)`
-only to reuse an existing compatible adapter. The supported ABI is Linux/ELF
-with standard, unnamespaced **NCrystal 4.4.6** and the legacy constructor
-route. Other versions require an adapter verified for their ABI.
+The process-local capture adapter must be built once using
+`processing.backends.liquid_capture.build.build_capture_library`. The initial
+supported ABI is Linux/ELF, unnamespaced **NCrystal 4.4.6**. A future version
+requires a separate verified adapter. External packages are never patched.
+Pass the resulting library to `NCrystalRunner(liquid_capture_library=...)`.
+The original solid constructor and methods remain available.
 
 Processing prepares a transient material using the established VDOS adapter and
 `replace_vdos`, preserving the custom liquid settings and unrelated dynamics.
@@ -206,20 +212,5 @@ coordinates can therefore be NaN. Ensemble aggregation removes those missing
 coordinates before alignment, rather than treating them as invalid physics or
 fabricating zeros on the source grid.
 
-The Analyzer path returns in-memory results. For the separate production
-handoff to experimental liquid MF7, see the
-[Processing guide](../processing/PROCESSING_INTEGRATION_GUIDE.md). The
-[liquid Analyzer guide](../TARA_LIQUID_ANALYZER_INTEGRATION.md) has a runnable
-setup example.
-
-### Outgoing-energy observables
-
-`calc_dsf=True` returns a table per incident energy, with scattering cosine
-on rows and outgoing energy on columns. `calc_scattering_kernel=True`
-integrates the DSF over scattering cosine. `calc_ratios=True` integrates the
-continuous outgoing-energy kernel above and below the incident energy and
-divides each contribution by the total continuous integral. Separate elastic
-cross sections are separate observables.
-
-See the [kinematics tests](../tests/test_analyzer/test_kinematics.py) and
-[NCrystal backend tests](../tests/test_analyzer/test_ncrystal_backends.py).
+No MF7 or ACE capability is enabled by this change. Existing export guards stay
+in force.

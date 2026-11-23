@@ -312,6 +312,29 @@ def add_custom_liquids(text: str, entries: Iterable[LiquidAtomSettings]) -> str:
     return text.rstrip() + "\n\n" + render_custom_liquids(entries)
 
 
+def replace_custom_liquids(text: str, entries: Iterable[LiquidAtomSettings]) -> str:
+    """Replace an existing liquid section and preserve the other NCMAT sections.
+
+    Parameters
+    ----------
+    text : str
+        NCMAT document with exactly one custom liquid section.
+    entries : Iterable[LiquidAtomSettings]
+        Replacement settings for the liquid species.
+
+    Returns
+    -------
+    str
+        NCMAT document containing the replacement section.
+    """
+    header, sections = _split_ncmat(text)
+    if sum(tag == "CUSTOM_LIQUIDS" for tag, _ in sections) != 1:
+        raise ValueError("Expected exactly one @CUSTOM_LIQUIDS block.")
+    liquid = render_custom_liquids(entries)
+    return header + "".join(liquid if tag == "CUSTOM_LIQUIDS" else raw
+                            for tag, raw in sections)
+
+
 def validate_regular_vdos_grid(energy_ev) -> float:
     """Validate an NCrystal VDOS grid without invoking its C++ regulariser.
 

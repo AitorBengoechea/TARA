@@ -1,10 +1,13 @@
 """Analyzer adapter for the shared NJOY Processing backend."""
 
+from dataclasses import dataclass
+
 from endf_parserpy import EndfParserPy
 
 from analyzer.backends.njoy_engine import NjoyEngine
 from analyzer.core_interfaces import BaseRunner
 from core.data.input_pdos import PhononSpectra
+from core.data.material_scattering import MaterialScatteringModel
 from processing.backends.njoy_processor import NjoyProcessor
 
 
@@ -55,17 +58,17 @@ class NjoyRunner(BaseRunner):
     def execute(
         self,
         sample_index: int,
-        spectrum: PhononSpectra,
+        spectrum: PhononSpectra | MaterialScatteringModel,
         **kwargs,
     ) -> NjoyEngine:
-        """Evaluate one spectrum through the shared NJOY Processing backend.
+        """Dispatch one spectrum or material through NJOY Processing.
 
         Parameters
         ----------
         sample_index : int
             Identifier of the stochastic sample being evaluated.
-        spectrum : PhononSpectra
-            Source phonon spectrum to evaluate or perturb.
+        spectrum : PhononSpectra or MaterialScatteringModel
+            Vibrational spectrum or sampled liquid material.
         **kwargs : Any
             THERMR options and the optional LEAPR `export_full_spectra` flag.
 
@@ -76,8 +79,15 @@ class NjoyRunner(BaseRunner):
         """
         del sample_index  # Execution identity is owned by Processing.
 
-        # Processing owns NJOY deck execution and the lifetime of its temporary tapes.
-        with self.processor.execute_analysis(
+        if isinstance(spectrum, MaterialScatteringModel):
+            runner = _NjoyTranslationRunner(self.processor)
+            pdos = spectrum.dynamics.continuous
+        else:
+            runner = _NjoyVibrationRunner(self.processor)
+            pdos = spectrum
+
+        # Both paths expose the same tape contract while Processing owns the sandbox.
+        with runner.execute(
             spectrum,
             temperature=self.temperature,
             thermr_emax=kwargs.get("thermr_emax", 5.0),
@@ -102,8 +112,8 @@ class NjoyRunner(BaseRunner):
             base_endf_file=self.base_endf_file,
             temperature=self.temperature,
             mass_amu=self.mass_amu,
-            energy_grid=spectrum.energy_grid,
-            pdos=spectrum.density_values,
+            energy_grid=pdos.energy_grid,
+            pdos=pdos.density_values,
             leapr_tree=leapr_tree,
             thermr_tree=thermr_tree,
             njoy_output_text=stdout_text,
@@ -118,3 +128,63 @@ class NjoyRunner(BaseRunner):
             Backend state returned by the runner for a single evaluation.
         """
         del runner_output
+
+
+@dataclass(frozen=True)
+class _NjoyVibrationRunner:
+    """Delegate a vibrational realization to Processing.
+
+    Parameters
+    ----------
+    processor : NjoyProcessor
+        Configured NJOY backend shared by the public runner.
+    """
+
+    processor: NjoyProcessor
+
+    def execute(self, spectrum, **options):
+        """Return the Processing context for a vibrational sample.
+
+        Parameters
+        ----------
+        spectrum : PhononSpectra
+            Spectrum to inject into the reference template.
+        **options : dict
+            Temperature in kelvin and LEAPR and THERMR options.
+
+        Returns
+        -------
+        contextlib.AbstractContextManager
+            Context exposing the resulting tapes.
+        """
+        return self.processor.execute_analysis(spectrum, **options)
+
+
+@dataclass(frozen=True)
+class _NjoyTranslationRunner:
+    """Delegate translation-only or joint material realizations to Processing.
+
+    Parameters
+    ----------
+    processor : NjoyProcessor
+        Configured NJOY backend shared by the public runner.
+    """
+
+    processor: NjoyProcessor
+
+    def execute(self, material, **options):
+        """Return the Processing context for a complete material sample.
+
+        Parameters
+        ----------
+        material : MaterialScatteringModel
+            Liquid realization containing spectrum and translation parameters.
+        **options : dict
+            Temperature in kelvin and LEAPR and THERMR options.
+
+        Returns
+        -------
+        contextlib.AbstractContextManager
+            Context exposing the resulting tapes.
+        """
+        return self.processor.execute_material_analysis(material, **options)

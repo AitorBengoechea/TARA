@@ -1,16 +1,36 @@
 """Shared S(alpha,beta) normalization and multi-Ein parser orchestration."""
 from abc import ABC
+from dataclasses import fields
 
 import numpy as np
 import pandas as pd
 
 from analyzer.core_interfaces import BaseParser
-from analyzer.physics.data_models import DifferentialData, IntegralData
+from analyzer.physics.data_models import DifferentialData, IntegralData, ThermodynamicsData
 from analyzer.physics.kinematics import Dsf, canonicalize_sab
 
 
 class BaseTslParser(BaseParser, ABC):
     """Normalize backend S(alpha,beta) and collect shared kinematic results."""
+
+    def _thermodynamics_for(self, engine, requested):
+        """Return thermodynamic observables when requested by the caller.
+
+        Parameters
+        ----------
+        engine : object
+            Backend state holding the vibrational data.
+        requested : bool
+            Whether to evaluate thermodynamic quantities.
+
+        Returns
+        -------
+        ThermodynamicsData
+            Calculated values or NaNs for unrequested quantities.
+        """
+        if requested:
+            return self._extract_thermodynamics(engine)
+        return ThermodynamicsData(**{field.name: np.nan for field in fields(ThermodynamicsData)})
 
     def _apply_universal_kinematics(
         self,

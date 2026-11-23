@@ -44,6 +44,10 @@ def test_runner_builds_and_releases_temporary_adapter(tmp_path, monkeypatch):
     )
     with patch.object(NCrystalLiquidAnalysisProcessor, '_verify_adapter', return_value={}):
         runner = NCrystalRunner(str(SOURCE), 295., temp_dir=str(tmp_path))
+        assert not build_paths
+        assert runner.prepare_analysis({}, {})["capture_kernel"] is False
+        assert not build_paths
+        runner.prepare_analysis({}, {"calc_sab": True})
 
     assert build_paths == [runner.processor.capture_library]
     assert runner.processor.capture_library.is_file()
@@ -83,15 +87,13 @@ def _live_job(args):
     return result
 
 
-@pytest.fixture(scope="session")
-def live_library(liquids_plugin, tmp_path_factory):
-    """Build one capture adapter per test session or use an explicit override."""
-    from processing.backends.liquid_capture.build import build_capture_library
-
-    override = os.environ.get("TARA_TEST_LIQUID_CAPTURE_LIBRARY")
-    if override:
-        return str(Path(override).resolve(strict=True))
-    return str(build_capture_library(tmp_path_factory.mktemp("liquid_capture_build")))
+@pytest.fixture
+def live_library():
+    """Require an explicitly configured, locally built native adapter."""
+    path = os.environ.get('TARA_TEST_LIQUID_CAPTURE_LIBRARY')
+    if not path:
+        pytest.skip('Set TARA_TEST_LIQUID_CAPTURE_LIBRARY for real-plugin acceptance tests')
+    return path
 
 
 def test_live_sequential_and_spawn_parallel_equivalence(live_library, tmp_path):
@@ -247,3 +249,43 @@ def test_modified_adapter_is_rejected_before_running_plugin(live_library, tmp_pa
         stream.write(b'changed')
     with pytest.raises(RuntimeError, match='installation changed'):
         NCrystalLiquidAnalysisProcessor(SOURCE, 295., capture_library=altered)
+
+
+def test_material_runner_native_cross_sections_and_capture_agree(live_library, tmp_path):
+    """Compare native and captured material paths at the same incident energies.
+
+    Parameters
+    ----------
+    live_library : pathlib.Path
+        Verified capture adapter for the installed NCrystal library.
+    tmp_path : pathlib.Path
+        Temporary directory for backend resources.
+    """
+    import NCrystal as NC
+    from scipy.constants import physical_constants
+    from analyzer.ensemble_analyzer import EnsembleAnalyzer
+    from core.data.material_ensemble import MaterialEnsemble
+    from core.data.material_scattering import MaterialScatteringModel, ScatteringSpecies, SpeciesDynamics
+    from input_output.ncrystal.liquids import parse_custom_liquids
+
+    neutron_mass = physical_constants["neutron mass in u"][0]
+    hydrogen = ScatteringSpecies("H", 2, NC.atomDB("H").averageMassAMU() / neutron_mass)
+    oxygen = ScatteringSpecies("O", 1, NC.atomDB("O").averageMassAMU() / neutron_mass)
+    entry, = parse_custom_liquids(SOURCE.read_text())
+    dynamics = SpeciesDynamics(
+        spectrum(), entry.ws, entry.wt, "egelstaff_schofield", translation_parameter=entry.c,
+    )
+    reference = MaterialScatteringModel("water", "liquid", 295, hydrogen, dynamics, (oxygen,))
+    materials = MaterialEnsemble(reference, np.array([entry.wt]), np.array([entry.c * 1.1]))
+    runner = NCrystalRunner(str(SOURCE), 295, temp_dir=str(tmp_path),
+                            liquid_capture_library=live_library)
+    analyzer = EnsembleAnalyzer(materials, runner, NCrystalParser())
+    parser_options = dict(energy_grid=np.geomspace(1e-5, 0.5, 20), calc_thermodynamics=False)
+    analyzer.compute(parallel=False, parser_kwargs=parser_options)
+    assert runner.processor.capture_library is None
+    native = analyzer.raw_results[0].integ.xs_total.copy()
+    assert not np.allclose(native, analyzer.reference_result.integ.xs_total)
+    analyzer.compute(parallel=False, parser_kwargs={**parser_options, "calc_sab": True})
+    assert runner.processor.capture_library.is_file()
+    assert not analyzer.raw_results[0].diff.sab.empty
+    np.testing.assert_allclose(analyzer.raw_results[0].integ.xs_total, native, rtol=1e-9)

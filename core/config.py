@@ -3,6 +3,7 @@ Configuration gateway for the TARA stochastic sampling engine.
 """
 import warnings
 import math
+from collections.abc import Mapping
 from numbers import Real
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
@@ -14,9 +15,9 @@ class TaraConfigError(Exception):
 
 
 @dataclass
-class TaraConfig:
+class VibrationSamplingConfig:
     """
-    Configuration gateway for TARA stochastic sampling.
+    Bounds and sampling strategies for vibrational spectra.
 
     This class enforces mandatory perturbation limits and algorithmic defaults,
     ensuring all parameters are physically valid before initializing the mathematical
@@ -104,7 +105,6 @@ class TaraConfig:
         if self.n_samples < 0:
             raise TaraConfigError("The sample ensemble size (n_samples) cannot be negative.")
         elif self.n_samples == 0:
-            import warnings
             warnings.warn("n_samples is set to 0. This configuration is only valid for preview generation.")
         
         for name in ("max_energy_shift_mev", "max_amplitude_shift_pct"):
@@ -124,7 +124,7 @@ class TaraConfig:
             raise TaraConfigError("Amplitude shifting boundary cannot be negative (%).")
             
         # Reject configurations where ALL variance is locked
-        if self.max_energy_shift_mev == 0.0 and self.max_amplitude_shift_pct == 0.0:
+        if not self._has_active_sampling():
             raise TaraConfigError("At least one perturbation boundary must be strictly positive.")
 
         # Validate Grid Partitioning
@@ -183,6 +183,15 @@ class TaraConfig:
             raise TaraConfigError(
                 f"variable_coupling must be one of {valid_coupling}."
             )
+
+    @property
+    def vibration_enabled(self) -> bool:
+        """Whether an energy or amplitude perturbation is active."""
+        return self.max_energy_shift_mev > 0 or self.max_amplitude_shift_pct > 0
+
+    def _has_active_sampling(self) -> bool:
+        """Whether the configuration enables any perturbation."""
+        return self.vibration_enabled
 
 @dataclass(frozen=True)
 class DiffusionSamplingConfig:
@@ -245,3 +254,55 @@ class DiffusionSamplingConfig:
             raise TaraConfigError("joint_independent requires both positive bounds.")
         if self.max_weight_shift_pct > 0 and self.weight_compensation != "continuous_only":
             raise TaraConfigError("Weight variation requires explicit continuous_only compensation.")
+
+
+@dataclass
+class TaraConfig(VibrationSamplingConfig):
+    """Configure vibrational, translational, or joint sampling.
+
+    Parameters
+    ----------
+    max_energy_shift_mev, max_amplitude_shift_pct : float, optional
+        Vibrational perturbation bounds. Both default to zero, which is
+        valid for translation-only sampling.
+    n_samples : int, optional
+        Stochastic sample count for all active perturbations. Zero is only
+        supported for a deterministic vibrational preview.
+    diffusion : mapping or DiffusionSamplingConfig, optional
+        Translation settings. Pass a mapping with ``enabled=True`` and the
+        appropriate mode, bounds, and weight-compensation policy to activate
+        diffusion sampling. Omitting this option keeps the vibration-only API.
+
+    See Also
+    --------
+    VibrationSamplingConfig : Other vibrational settings and shared design options.
+    DiffusionSamplingConfig : Modes, bounds, and weight-compensation policies.
+    """
+
+    max_energy_shift_mev: float = 0.0
+    max_amplitude_shift_pct: float = 0.0
+    diffusion: DiffusionSamplingConfig | Mapping[str, object] | None = field(
+        default=None, kw_only=True,
+    )
+
+    def __post_init__(self) -> None:
+        """Validate the translation options and the inherited sampling bounds."""
+        if isinstance(self.diffusion, Mapping):
+            try:
+                self.diffusion = DiffusionSamplingConfig(**self.diffusion)
+            except TypeError as error:
+                raise TaraConfigError(f"Invalid diffusion settings: {error}") from error
+        elif self.diffusion is not None and not isinstance(self.diffusion, DiffusionSamplingConfig):
+            raise TaraConfigError("diffusion must be a mapping or DiffusionSamplingConfig.")
+        if self.diffusion_enabled and type(self.n_samples) is int and self.n_samples == 0:
+            raise TaraConfigError("Diffusion sampling requires a positive n_samples.")
+        super().__post_init__()
+
+    @property
+    def diffusion_enabled(self) -> bool:
+        """Whether diffusion sampling has been enabled explicitly."""
+        return self.diffusion is not None and self.diffusion.enabled
+
+    def _has_active_sampling(self) -> bool:
+        """Allow the vibrational bounds to stay at zero for translation only."""
+        return self.vibration_enabled or self.diffusion_enabled

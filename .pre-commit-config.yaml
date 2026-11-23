@@ -1,13 +1,10 @@
 repos:
-  - repo: local
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
     hooks:
-      - id: generate-project-map
-        name: Generate Project Map
-        entry: python generate_ai_context.py
-        language: system
-        pass_filenames: false
-      - id: generate-test-overview
-        name: Generate Test Overview
-        entry: python tests/generate_test_overview.py
-        language: system
-        pass_filenames: false
+      - id: check-ast
+      - id: check-json
+      - id: check-toml
+      - id: check-yaml
+      - id: check-merge-conflict
+        args: [--assume-in-merge]

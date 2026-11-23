@@ -13,6 +13,8 @@ from scipy.spatial.distance import pdist, squareform
 from sklearn.preprocessing import StandardScaler
 
 from core.data.input_pdos import PhononSpectra
+from core.data.material_ensemble import MaterialEnsemble
+from core.data.material_scattering import MaterialScatteringModel
 from core.data.spectra_ensemble import SpectraEnsemble
 
 from analyzer.core_interfaces import BaseParser, BaseRunner
@@ -26,7 +28,7 @@ _REFERENCE_SAMPLE_INDEX = -1
 
 def _isolated_worker(
     index: int,
-    spectrum: PhononSpectra,
+    spectrum: PhononSpectra | MaterialScatteringModel,
     runner: BaseRunner,
     parser: BaseParser,
     runner_kwargs: Dict[str, Any],
@@ -39,8 +41,8 @@ def _isolated_worker(
     ----------
     index : int
         Stable ensemble sample index used by the runner and parser.
-    spectrum : PhononSpectra
-        Spectrum to evaluate.
+    spectrum : PhononSpectra or MaterialScatteringModel
+        Spectrum or full material realization to evaluate.
     runner : BaseRunner
         Backend execution adapter.
     parser : BaseParser
@@ -66,7 +68,7 @@ def _isolated_worker(
 
 class EnsembleAnalyzer:
     """
-    Analyze a :class:`SpectraEnsemble` through one backend pipeline.
+    Analyze vibrational or material realizations through one backend pipeline.
 
     The analyzer preserves the original stochastic sample indices throughout
     execution, aggregation, and reduction. The baseline spectrum stored in
@@ -75,8 +77,8 @@ class EnsembleAnalyzer:
 
     Parameters
     ----------
-    ensemble : SpectraEnsemble
-        Stochastic phonon ensemble produced by TARA.
+    ensemble : SpectraEnsemble or MaterialEnsemble
+        Stochastic spectra or complete liquid materials produced by TARA.
     runner : BaseRunner
         Backend execution adapter.
     parser : BaseParser
@@ -84,12 +86,12 @@ class EnsembleAnalyzer:
     sample_indices : sequence of int, optional
         Original ensemble indices to analyze. If omitted, all stochastic
         samples are selected. This argument is primarily used when creating a
-        reduced analyzer while retaining the same ``SpectraEnsemble``.
+        reduced analyzer while retaining the original ensemble.
 
     Raises
     ------
     TypeError
-        If ``ensemble`` is not a ``SpectraEnsemble``.
+        If the supplied ensemble has an unsupported type.
     ValueError
         If ``sample_indices`` contains duplicates or indices outside the
         ensemble range.
@@ -97,7 +99,7 @@ class EnsembleAnalyzer:
 
     def __init__(
         self,
-        ensemble: SpectraEnsemble,
+        ensemble: SpectraEnsemble | MaterialEnsemble,
         runner: BaseRunner,
         parser: BaseParser,
         sample_indices: Optional[Sequence[int]] = None,
@@ -106,8 +108,8 @@ class EnsembleAnalyzer:
 
         Parameters
         ----------
-        ensemble : SpectraEnsemble
-            Stochastic spectra ensemble; its reference spectrum is kept separate.
+        ensemble : SpectraEnsemble or MaterialEnsemble
+            Stochastic spectra or material realizations with a separate reference.
         runner : BaseRunner
             Backend adapter used to evaluate one spectrum.
         parser : BaseParser
@@ -120,11 +122,8 @@ class EnsembleAnalyzer:
         TypeError
             If the input or required state violates the operation contract.
         """
-        if not isinstance(ensemble, SpectraEnsemble):
-            raise TypeError(
-                "ensemble must be a SpectraEnsemble instance. "
-                "Pass the object returned by TaraSampler.generate_ensemble()."
-            )
+        if not isinstance(ensemble, (SpectraEnsemble, MaterialEnsemble)):
+            raise TypeError("ensemble must be a SpectraEnsemble instance or a MaterialEnsemble.")
 
         self.ensemble = ensemble
         self.runner = runner
@@ -164,12 +163,12 @@ class EnsembleAnalyzer:
             If indices are empty, duplicated, or outside the ensemble range.
         """
         if sample_indices is None:
-            return np.arange(self.ensemble.n_samples, dtype=np.int64)
+            return np.arange(len(self.ensemble), dtype=np.int64)
 
         indices = np.asarray(sample_indices, dtype=np.int64)
         if indices.ndim != 1 or indices.size == 0:
             raise ValueError("sample_indices must be a non-empty one-dimensional sequence.")
-        if np.any(indices < 0) or np.any(indices >= self.ensemble.n_samples):
+        if np.any(indices < 0) or np.any(indices >= len(self.ensemble)):
             raise ValueError("sample_indices contains an index outside the ensemble range.")
         if np.unique(indices).size != indices.size:
             raise ValueError("sample_indices must not contain duplicate indices.")
@@ -203,10 +202,12 @@ class EnsembleAnalyzer:
         -----
         The reference spectrum never appears in ``raw_results`` or aggregated
         stochastic DataFrames. This preserves one-to-one alignment between
-        analyzer ``Sample_Index`` values and ``SpectraEnsemble`` sample indices.
+        analyzer ``Sample_Index`` values and the original ensemble indices.
         """
-        runner_kwargs = runner_kwargs or {}
+        runner_kwargs = dict(runner_kwargs or {})
         parser_kwargs = parser_kwargs or {}
+        if isinstance(self.runner, BaseRunner):
+            runner_kwargs = self.runner.prepare_analysis(runner_kwargs, parser_kwargs)
 
         self.raw_results = self._compute_stochastic_results(
             parallel=parallel,

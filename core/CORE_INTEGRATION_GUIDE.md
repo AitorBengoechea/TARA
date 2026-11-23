@@ -5,31 +5,31 @@
 The `core` directory is the foundational pillar and the mathematical heart of the framework. It acts as the absolute **Single Source of Truth** for data schemas, ensemble generation algorithms, and global configurations.
 
 **Golden Rule of the Core Layer:** **Zero Domain Logic.**
-The `core` folder must *never* know about NJOY, NCrystal, VASP ... It does not parse external files, and it does not run external executables. It strictly defines *what* the data is (via `core/data/`) and provides the pure mathematical algorithms to perturb, sample, and reconstruct that data (via `core/math_engine/`, `core/physics/`, and `core/sampler/`).
+The `core` folder must *never* know about NJOY, NCrystal, VASP, or CASTEP. It does not parse external files, and it does not run external executables. It strictly defines *what* the data is (via `core/data/`) and provides the pure mathematical algorithms to perturb, sample, and reconstruct that data (via `core/math_engine/` and `core/sampler/`).
 
 ## 2. Directory Structure
 
-The core domain is structured into root-level utilities and four operational sub-packages:
+The core domain is structured into root-level utilities and three distinct operational sub-packages:
 
 ```text
 core/
 ├── config.py           # Global configurations and environment constants
 ├── data/               # Universal data schemas (e.g., input_pdos.py)
 ├── math_engine/        # Pure mathematical fitting and reconstruction algorithms
-├── sampler/            # Ensemble generation and statistical topology strategies
-└── physics/            # Backend-independent vibrational reconstruction
+└── sampler/            # Ensemble generation and statistical topology strategies
 ```
 
-## Physical material models
+## V2 physical material models
 
 `core.data.material_scattering` introduces `MaterialScatteringModel`,
 `SpeciesDynamics`, `ScatteringSpecies` and `DiscreteOscillator`. All are
 backend-independent physical data containers and validators. They require
 unit-normalized continuous spectra while keeping oscillator and translational
 weights separate. `MaterialScatteringModel.with_spectrum()` creates a new
-material realization without changing fixed model components. The model can also store a single tabulated full vibrational distribution
-with no separate oscillators. See the [LEAPR I/O guide](../input_output/IO_INTEGRATION_GUIDE.md)
-for the projection from that representation to a native backend input.
+material realization without changing fixed model components. It is the
+first step toward independently sampled oscillator modes, but does not replace
+or mutate the existing `SpectraEnsemble` interface. See
+`docs/sections/liquid-material-ace.md`.
 
 ### Egelstaff–Schofield translation (CAB water)
 
@@ -39,21 +39,46 @@ translation parameter separately from the unit-integral continuous spectrum.
 It is not treated as an arbitrary SI diffusion constant or added to the VDOS.
 Rounded CAB component weights are accepted within absolute tolerance 1e-5.
 
-## Optional liquid translational sampling
+## Public sampling API
 
-`core.config.DiffusionSamplingConfig(enabled=False)` is an opt-in, independent
-sensitivity configuration. `core.sampler.diffusion_sampler.DiffusionSampler`
-only supports strictly positive Egelstaff--Schofield `translation_parameter=c`.
-It transforms independent physical diffusivity and weight ratios into
-`c_sample = c_reference * diffusivity_factor / weight_factor`.
-`core.data.material_ensemble.MaterialEnsemble` lazily composes these parameters
-with optional existing `SpectraEnsemble` samples. The reference is separate;
-`__getitem__(0)` is stochastic sample 001. No backend dependencies are added.
-Weight variation is supported only with explicitly selected continuous-only
-compensation, preserving separately modeled oscillators and source rounding
-residuals. If the model already combines the modes in a full VDOS, compensation
-changes the total vibrational coefficient.
-Free-gas to Egelstaff--Schofield model transitions are excluded.
+Use `TaraConfig` and `TaraSampler` for vibration-only, translation-only,
+and joint studies. Both parts share the sample count, design method, and seed.
+Vibration-only studies take a `PhononSpectra` or a material and return a
+`SpectraEnsemble`. Enabling `diffusion` requires an Egelstaff–Schofield liquid
+material and returns a `MaterialEnsemble`. For translation only, leave both
+vibrational bounds at zero. For joint sampling, give at least one positive
+vibrational bound and enable diffusion in the same configuration.
+
+```python
+from core.config import TaraConfig
+from core.sampler.concrete_samplers import TaraSampler
+
+configuration = TaraConfig(
+    n_samples=100,
+    random_seed=42,
+    max_energy_shift_mev=1.0,
+    max_amplitude_shift_pct=3.0,
+    diffusion=dict(
+        enabled=True,
+        mode="joint_independent",
+        max_diffusivity_shift_pct=10.0,
+        max_weight_shift_pct=10.0,
+        weight_compensation="continuous_only",
+    ),
+)
+sampler = TaraSampler(config=configuration, material=material)
+ensemble = sampler.generate_ensemble(batch_size=32)
+```
+
+Internally, `VibrationSamplingConfig` validates the vibrational settings and
+`VibrationSampler` generates the spectra. `DiffusionSamplingConfig` validates
+the translation settings and `DiffusionSampler` transforms the physical
+diffusivity and weight ratios into
+`c_sample = c_reference * diffusivity_factor / weight_factor`. Continuous-only
+compensation preserves oscillator contributions and source rounding residuals.
+`MaterialEnsemble` combines each translation draw with the matching vibration
+sample when available. The reference is separate and index 0 is stochastic
+sample 001. `generate_ensemble()` returns the result directly.
 
 
 ## Centralized parameter-space designs (LHS default)
@@ -103,7 +128,7 @@ one topology block before matrix chunking**. The independent unperturbed
 For `sampling_method="monte_carlo"`, VDOS draws retain the legacy global
 `np.random.uniform` call order, including draws for physically inactive
 variables; liquid diffusion retains its original local NumPy generator and
-its previous seed derivation in `application/ace_workflow.py`. Monte Carlo
+its historical ACE seed derivation in `TaraSampler`. Monte Carlo
 `RandomTopology` retains `np.random.randint`. LHS `RandomTopology` uses its
 own seeded discrete-topology stream; topology draws are **not LHS variables**.
 In the LHS branch, `ParameterSpaceSampler` does not touch global NumPy state.
@@ -114,25 +139,6 @@ block boundaries and multipliers. Existing `SpectraEnsemble`, `SamplingBlock`,
 Diffusion uses `spectra_ensemble.sampling_blocks` to align its stratification
 with the selected VDOS sub-ensembles; diffusion-only uses one block.
 
-Test ownership is in [parameter-space tests](../tests/test_core/test_parameter_space.py),
-[VDOS sampling tests](../tests/test_core/test_vdos_sampling.py), and
-[diffusion sampling tests](../tests/test_core/test_diffusion_sampling.py).
-
-## Reconstructing a full vibrational spectrum
-
-`core.physics.vibrational_spectrum.reconstruct_vibrational_spectrum` combines
-a weighted continuum with oscillator contributions on a uniform grid starting
-at zero. It returns a unit-area spectrum and a separate total vibrational
-weight. Translation remains a separate component.
-
-The default representation uses area-normalized Gaussians with a 1 meV
-standard deviation. This width is a numerical model used in the illustrative
-water example. The routine refines its default grid to a spacing no larger
-than one third of the width. A supplied grid must resolve the Gaussians and
-cover their tails. With `oscillator_sigma_ev=0.0`, two-node deposition
-preserves each discrete mode's area and energy centroid.
-
-The sampler perturbs the reconstructed curve through the existing
-`TaraSampler` interface. Separate Core controls for oscillator energy and
-weight are outside this workflow. See the [deposition regressions](../tests/test_core/test_vibrational_spectrum.py)
-and [full-spectrum export tests](../tests/test_input_output/test_leapr_spectrum_export.py).
+Test ownership: `tests/test_core/test_parameter_space_lhs.py`,
+`tests/test_core/test_lhs_vdos_integration.py`, and
+`tests/test_core/test_lhs_diffusion_integration.py`.

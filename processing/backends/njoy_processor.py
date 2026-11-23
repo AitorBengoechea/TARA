@@ -17,8 +17,9 @@ import uuid
 from endf_parserpy import EndfParserPy
 
 from core.data.input_pdos import PhononSpectra
+from core.data.material_scattering import MaterialScatteringModel
 from input_output.leapr.core import LeaprFile
-from input_output.leapr.workflows import serialize_leapr_spectrum
+from input_output.leapr.workflows import serialize_leapr_spectrum, serialize_leapr_material
 from processing.deck_builders.leapr_builder import build_analysis_deck
 
 
@@ -282,6 +283,65 @@ class NjoyProcessor:
         Iterator[NjoyExecution]
             Transient NJOY execution context.
         """
+        self._require_analysis_template()
+        leapr_module_text = serialize_leapr_spectrum(
+            self._leapr_template,
+            spectrum,
+            temperature=temperature,
+            export_full_spectra=export_full_spectra,
+        )
+        with self._execute_analysis_deck(
+            leapr_module_text, temperature, thermr_emax, thermr_tol, thermr_nbin,
+        ) as execution:
+            yield execution
+
+    @contextmanager
+    def execute_material_analysis(
+        self, material: MaterialScatteringModel, *, temperature: float,
+        thermr_emax: float = 5.0, thermr_tol: float = 0.05,
+        thermr_nbin: int = 16, export_full_spectra: bool = False,
+    ) -> Iterator[NjoyExecution]:
+        """Execute LEAPR and THERMR with a complete sampled liquid material.
+
+        Parameters
+        ----------
+        material : MaterialScatteringModel
+            Realization with vibrational data and sampled translation settings.
+        temperature : float
+            Configured processing temperature in kelvin.
+        thermr_emax : float, optional
+            THERMR upper energy in eV.
+        thermr_tol : float, optional
+            THERMR interpolation tolerance.
+        thermr_nbin : int, optional
+            THERMR angular bins.
+        export_full_spectra : bool, optional
+            Write the full vibrational spectrum as a continuum.
+
+        Yields
+        ------
+        NjoyExecution
+            Transient output tapes, valid within this context.
+        """
+        self._require_analysis_template()
+        # Material serialization preserves the sampled Card 13 coefficients.
+        module = serialize_leapr_material(
+            self._leapr_template, material, temperature=temperature,
+            export_full_spectra=export_full_spectra,
+        )
+        with self._execute_analysis_deck(
+            module, temperature, thermr_emax, thermr_tol, thermr_nbin,
+        ) as execution:
+            yield execution
+
+    def _require_analysis_template(self):
+        """Require both input files before preparing an analysis deck.
+
+        Raises
+        ------
+        RuntimeError
+            If the base evaluation or LEAPR template was omitted.
+        """
         if (
             self._leapr_template is None
             or self.base_endf_file is None
@@ -292,12 +352,28 @@ class NjoyProcessor:
                 "base_leapr_file when constructing NjoyProcessor."
             )
 
-        leapr_module_text = serialize_leapr_spectrum(
-            self._leapr_template,
-            spectrum,
-            temperature=temperature,
-            export_full_spectra=export_full_spectra,
-        )
+    @contextmanager
+    def _execute_analysis_deck(
+        self, leapr_module_text, temperature, thermr_emax, thermr_tol, thermr_nbin,
+    ):
+        """Assemble and execute the common LEAPR and THERMR sequence.
+
+        Parameters
+        ----------
+        leapr_module_text : str
+            Prepared sample-specific LEAPR input.
+        temperature, thermr_emax : float
+            Processing temperature in kelvin and upper THERMR energy in eV.
+        thermr_tol : float
+            THERMR interpolation tolerance.
+        thermr_nbin : int
+            Number of THERMR angular bins.
+
+        Yields
+        ------
+        NjoyExecution
+            Execution with staged input and output tapes.
+        """
         leapr_mat = int(self._leapr_template.material_info["mat"])
         thermr_natom = int(self._leapr_template.principal_scatterer["npr"])
         thermr_icoh = (

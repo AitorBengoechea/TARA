@@ -89,6 +89,22 @@ python -m pytest -ra
 
 Pytest reports which tests were skipped and why. Tests that run real NJOY or optional native integrations need the relevant executables, plugin, or inputs.
 
+## Repository checks
+
+| File | Purpose |
+| --- | --- |
+| [`.gitignore`](.gitignore) | Keeps local environments, caches, build artifacts, and `tara_output/` out of new commits. Test fixtures and notebook inputs remain eligible for tracking. |
+| [`.pre-commit-config.yaml`](.pre-commit-config.yaml) | Checks Python, JSON, TOML, and YAML syntax and catches conflict markers before a local commit. |
+| [`.github/workflows/test.yml`](.github/workflows/test.yml) | Runs pytest on Ubuntu with Python 3.13 when a pull request is opened, reopened, or updated. Tests requiring additional native tools or data may skip. |
+
+Enable the local checks once per clone:
+
+```bash
+python -m pip install pre-commit
+pre-commit install
+pre-commit run --all-files
+```
+
 ## Contributing
 
 Use [TARA Issues](https://github.com/vaibhavjaiswal-asnr/TARA/issues) to report a problem or discuss a change. To contribute, push the branch to your fork (`origin`). Then open a [pull request in upstream TARA](https://github.com/vaibhavjaiswal-asnr/TARA/pulls) using **Compare across forks**. Choose the intended upstream branch as the base and the branch in your fork as the compare branch. Describe the change and the tests that cover it.
@@ -97,25 +113,38 @@ Use paths relative to this README for files stored in the repository, such as `d
 
 ## Developer Guides: Extending the Framework
 
-This framework is built on a strict domain-driven architecture. We isolate execution, file I/O, mathematical sampling, and application logic into distinct boundaries. 
+Start with the project overview to understand the architecture. Use the project map to locate a module, or the notebook overview to find and maintain examples.
 
-If you want to add new features, file formats, or backends, **do not modify the core physics or sampling algorithms.** Instead, follow the strict protocols outlined in our integration guides: 
+| Document | What you’ll find |
+| --- | --- |
+| [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md) | The architecture, workflow contracts, and responsibilities of each domain. |
+| [PROJECT_MAP.md](PROJECT_MAP.md) | A repository inventory with the directory tree, domain statistics, and pointers to important files. |
+| [NOTEBOOK_OVERVIEW.md](NOTEBOOK_OVERVIEW.md) | Notebook organization, responsibilities, and conventions for maintaining the examples. |
 
-*   **[Core Integration Guide](./core/CORE_INTEGRATION_GUIDE.md):** Read this if you are adding new data schemas (`PhononSpectra`), mathematical smoothers, or new topological sampling strategies to the TARA engine.
-*   **[Input/Output Integration Guide](./input_output/IO_INTEGRATION_GUIDE.md):** Read this if you are adding support for a new third-party file format (e.g., VASP, GROMACS, custom JSON). 
-*   **[Backend Integration Guide](./analyzer/BACKEND_INTEGRATION_GUIDE.md):** Read this if you are connecting a new nuclear data execution engine (e.g., FLASSH, FRENDY).
-*   **[Application Integration Guide](./application/APP_INTEGRATION_GUIDE.md):** Read this if you are adding new commands, arguments, or features to the `cli.py` user interface.
+Use the integration guide for the domain where your change belongs.
 
+| Guide | What it covers |
+| --- | --- |
+| [Core Integration Guide](core/CORE_INTEGRATION_GUIDE.md) | Spectrum data structures, mathematical transformations, and sampling algorithms. |
+| [Input/Output Integration Guide](input_output/IO_INTEGRATION_GUIDE.md) | File parsing, material representation, and serialization for supported formats. |
+| [Processing Integration Guide](processing/PROCESSING_INTEGRATION_GUIDE.md) | How NJOY and NCrystal process material inputs and sampled spectra, including backend execution and kernel generation. |
+| [Backend Integration Guide](analyzer/BACKEND_INTEGRATION_GUIDE.md) | How the analyzer connects to backend runners and converts their results into shared analysis outputs. |
+| [Application Integration Guide](application/APP_INTEGRATION_GUIDE.md) | CLI commands, TOML settings, and orchestration of user workflows. |
 
 ---
+
 ## 🏛 Acknowledgments & Funding
 
 This work was supported by the European Union Horizon Europe programme through the **APRENDE** project (Grant Agreement No. 101061262).
+
+<div align="center">
+  <img src="docs/logo/aprende_logo.png" alt="TARA Logo" width="200">
+</div>
 
 The TARA project and TARA code are being developed at the **Autorité de Sûreté Nucléaire et de Radioprotection (ASNR)** as part of Task 4.2 (Thermal Neutron Scattering) within the APRENDE consortium.
 
 ## 📄 License
 
-This project is licensed under the MIT License.
+TARA is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
 
 ---

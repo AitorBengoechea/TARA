@@ -34,14 +34,14 @@ class NjoyParser(BaseTslParser):
         engine : NjoyEngine
             In-memory backend state from which the requested data are extracted.
         **kwargs : Any
-            Additional options accepted by the current interface.
+            Observable flags. Set ``calc_thermodynamics=False`` for cross-section-only studies.
 
         Returns
         -------
         PhysicsData
             Calculated result in the declared return type.
         """
-        thermo = self._extract_thermodynamics(engine)
+        thermo = self._thermodynamics_for(engine, kwargs.get("calc_thermodynamics", True))
         diff = DifferentialData()
         integ = IntegralData()
 

@@ -9,6 +9,7 @@ import pytest
 from application import ace_workflow
 from core.data.input_pdos import PhononSpectra
 from core.data.material_scattering import MaterialScatteringModel, ScatteringSpecies, SpeciesDynamics
+from core.sampler.concrete_samplers import VibrationSampler
 
 
 def _source():
@@ -26,6 +27,17 @@ def _config(*, mode='diffusivity_only', vib=False):
     options = {
         'max_energy_shift_mev': 1.0 if vib else 0.0,
         'max_amplitude_shift_pct': 0.0,
+        'grid_partition_method': 'automatic',
+        'automatic_partition_prominence_pct': 1.0,
+        'domain_splitting_strategy': 'fixed',
+        'correlation_strategy': 'independent',
+        'variable_coupling': 'independent',
+        'shared_grid_structure': True,
+        'freeze_origin': True,
+        'fast_amplitude': True,
+        'auto_normalize': True,
+        'amplitude_method': 'fast',
+        'spatial_method': 'diffeomorphic',
     }
     diffusion = dict(enabled=True, mode=mode, max_diffusivity_shift_pct=5.0,
                      max_weight_shift_pct=0.0)
@@ -33,15 +45,18 @@ def _config(*, mode='diffusivity_only', vib=False):
         sections={'diffusion_sampling': diffusion},
         section=lambda name: {
             'sampling': options,
-            'ensemble': dict(n_samples=2, random_seed=120, batch_size=2),
+            'ensemble': dict(n_samples=2, random_seed=120, batch_size=2, include_reference=True),
             'diffusion_sampling': diffusion,
         }[name],
     )
 
 
 def test_diffusion_only_does_not_invoke_vdos_sampler(monkeypatch):
-    """Diffusion-only mode must not instantiate the zero-variance TaraConfig."""
-    monkeypatch.setattr(ace_workflow, '_prepare_ensemble', lambda *_: pytest.fail('unexpected VDOS sampling'))
+    """Diffusion-only mode skips vibrational sampler initialization."""
+    def fail_on_initialization(*args, **kwargs):
+        pytest.fail('unexpected VDOS sampling')
+
+    monkeypatch.setattr(VibrationSampler, '__init__', fail_on_initialization)
     model = _source()
     sample = ace_workflow._prepare_diffusion_ensemble(_config(), model, model.dynamics.continuous.pdos)
     assert sample.reference is model
@@ -65,7 +80,11 @@ def test_joint_sampling_reuses_original_vdos_samples(monkeypatch):
             """Return an identical precomputed perturbation for either index."""
             return altered
 
-    monkeypatch.setattr(ace_workflow, '_prepare_ensemble', lambda *_: Vibrational())
+    def generate(self, *, batch_size):
+        assert batch_size == 2
+        return Vibrational()
+
+    monkeypatch.setattr(VibrationSampler, 'generate_ensemble', generate)
     new = ace_workflow._prepare_diffusion_ensemble(_config(vib=True), model, model.dynamics.continuous.pdos)
     assert new.spectra_ensemble is not None
     assert new[0].dynamics.continuous is altered

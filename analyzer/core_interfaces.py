@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict
 
 from core.data.input_pdos import PhononSpectra
+from core.data.material_scattering import MaterialScatteringModel
 from analyzer.physics.data_models import PhysicsData
 
 
@@ -13,12 +14,30 @@ class BaseRunner(ABC):
     Abstract interface for executing nuclear data calculations.
     
     A Runner is strictly responsible for setting up the environment, injecting 
-    the perturbed PhononSpectra into the backend (NCrystal or NJOY), executing 
+    a spectrum or material realization into the backend, executing 
     the calculation, and managing temporary files.
     """
 
+    def prepare_analysis(self, runner_kwargs: dict, parser_kwargs: dict) -> dict:
+        """Prepare execution options before evaluating the ensemble.
+
+        Parameters
+        ----------
+        runner_kwargs : dict
+            Explicit options for backend execution.
+        parser_kwargs : dict
+            Requested observables and extraction settings.
+
+        Returns
+        -------
+        dict
+            Options to pass to each execution, including the reference.
+        """
+        return runner_kwargs
+
     @abstractmethod
-    def execute(self, sample_index: int, spectrum: PhononSpectra, **kwargs) -> Any:
+    def execute(self, sample_index: int, spectrum: PhononSpectra | MaterialScatteringModel,
+                **kwargs) -> Any:
         """
         Executes the backend calculation for a single sample.
 
@@ -26,8 +45,8 @@ class BaseRunner(ABC):
         ----------
         sample_index : int
             The unique identifier for the sample (used for safe parallel temp files).
-        spectrum : PhononSpectra
-            The standardized, perturbed phonon density of states.
+        spectrum : PhononSpectra or MaterialScatteringModel
+            Spectrum or complete material realization.
         kwargs : dict
             Backend-specific execution flags (e.g., energy grids, temperature).
 

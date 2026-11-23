@@ -50,7 +50,7 @@ def _existing_input(path: Path, label: str) -> Path:
     return path
 
 
-def _prepare_ensemble(config: AceApplicationConfig, pdos: Any):
+def _prepare_ensemble(config: AceApplicationConfig, pdos: Any, *, material: Any = None):
     """Create a reproducibly seeded ensemble using the public Core APIs.
 
     Parameters
@@ -59,44 +59,49 @@ def _prepare_ensemble(config: AceApplicationConfig, pdos: Any):
         Validated workflow or backend configuration.
     pdos : Any
         Source phonon density of states.
+    material : MaterialScatteringModel, optional
+        Physical reference for workflows with diffusion sampling.
 
     Returns
     -------
-    object
-        Generated reference and sampled spectra.
+    SpectraEnsemble or MaterialEnsemble
+        Reference and stochastic realizations for the active perturbations.
     """
     import numpy as np
     from core.config import TaraConfig
     from core.data.input_pdos import PhononSpectra
     from core.sampler.concrete_samplers import TaraSampler
 
-    options = config.section('sampling')
+    sampling = config.section('sampling')
     ensemble = config.section('ensemble')
-    spectrum = PhononSpectra(pdos=pdos, auto_normalize=options['auto_normalize'])
+    diffusion = config.section('diffusion_sampling') if material is not None else None
     tara_config = TaraConfig(
         n_samples=ensemble['n_samples'],
-        max_energy_shift_mev=options['max_energy_shift_mev'],
-        max_amplitude_shift_pct=options['max_amplitude_shift_pct'],
-        grid_partition_method=options['grid_partition_method'],
-        automatic_partition_prominence_pct=options['automatic_partition_prominence_pct'],
-        manual_energy_ranges=[tuple(v) for v in options.get('manual_energy_ranges', [])] or None,
-        domain_splitting_strategy=options['domain_splitting_strategy'],
-        correlation_strategy=options['correlation_strategy'],
-        variable_coupling=options['variable_coupling'],
-        shared_grid_structure=options['shared_grid_structure'],
-        freeze_origin=options['freeze_origin'],
-        fast_amplitude=options['fast_amplitude'],
+        max_energy_shift_mev=sampling['max_energy_shift_mev'],
+        max_amplitude_shift_pct=sampling['max_amplitude_shift_pct'],
+        grid_partition_method=sampling['grid_partition_method'],
+        automatic_partition_prominence_pct=sampling['automatic_partition_prominence_pct'],
+        manual_energy_ranges=[tuple(v) for v in sampling.get('manual_energy_ranges', [])] or None,
+        domain_splitting_strategy=sampling['domain_splitting_strategy'],
+        correlation_strategy=sampling['correlation_strategy'],
+        variable_coupling=sampling['variable_coupling'],
+        shared_grid_structure=sampling['shared_grid_structure'],
+        freeze_origin=sampling['freeze_origin'],
+        fast_amplitude=sampling['fast_amplitude'],
         sampling_method=ensemble.get('sampling_method', 'latin_hypercube'),
         random_seed=ensemble['random_seed'],
+        diffusion=diffusion,
     )
-    # Historical Monte Carlo consumes the legacy global NumPy RNG.
-    # LHS (including random topology) uses independent seeded local streams.
-    if ensemble.get('sampling_method', 'latin_hypercube') == 'monte_carlo':
-        np.random.seed(ensemble['random_seed'])
+    spectrum = None
+    if sampling['max_energy_shift_mev'] > 0 or sampling['max_amplitude_shift_pct'] > 0:
+        spectrum = PhononSpectra(pdos=pdos, auto_normalize=sampling['auto_normalize'])
+        # Legacy vibrational Monte Carlo consumes the global NumPy RNG.
+        if ensemble.get('sampling_method', 'latin_hypercube') == 'monte_carlo':
+            np.random.seed(ensemble['random_seed'])
     sampler = TaraSampler(
-        config=tara_config, spectra=spectrum,
-        amplitude_method=options['amplitude_method'],
-        spatial_method=options['spatial_method'],
+        config=tara_config, spectra=spectrum, material=material,
+        amplitude_method=sampling['amplitude_method'],
+        spatial_method=sampling['spatial_method'],
     )
     samples = sampler.generate_ensemble(batch_size=ensemble['batch_size'])
     if ensemble['include_reference'] and samples.reference is None:
@@ -143,28 +148,10 @@ def _ncrystal_tapes(
 
 
 def _prepare_diffusion_ensemble(config: AceApplicationConfig, model: Any, pdos: Any):
-    """Combine optional independent diffusion and legacy VDOS realizations."""
-    from core.config import DiffusionSamplingConfig
-    from core.sampler.diffusion_sampler import DiffusionSampler
-
+    """Prepare translation-only or joint realizations for a physical liquid."""
     if model is None:
         raise ValueError("Diffusion sampling requires a liquid physical model.")
-    opts = config.section('sampling')
-    ensemble_config = config.section('ensemble')
-    vibrational = None
-    if opts['max_energy_shift_mev'] > 0 or opts['max_amplitude_shift_pct'] > 0:
-        vibrational = _prepare_ensemble(config, pdos)
-    diff = DiffusionSamplingConfig(**config.section('diffusion_sampling'))
-    # Legacy Monte Carlo keeps the V3 diffusion sequence. LHS uses the
-    # experiment seed with independent, named, sub-ensemble-scoped streams.
-    import numpy as np
-    method = ensemble_config.get('sampling_method', 'latin_hypercube')
-    seed = (np.random.SeedSequence([ensemble_config['random_seed'], 0xD1FF])
-            .generate_state(1)[0] if method == 'monte_carlo'
-            else ensemble_config['random_seed'])
-    return DiffusionSampler(model, diff, seed=int(seed), sampling_method=method).generate_ensemble(
-        ensemble_config['n_samples'], vibrational,
-    )
+    return _prepare_ensemble(config, pdos, material=model)
 
 
 def _process_njoy(config: AceApplicationConfig, endf_dir: Path, njoy: Path):

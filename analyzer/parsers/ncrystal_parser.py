@@ -34,14 +34,14 @@ class NCrystalParser(BaseTslParser):
         engine : NCrystalEngine
             In-memory backend state from which the requested data are extracted.
         **kwargs : Any
-            Additional options accepted by the current interface.
+            Observable flags. Set ``calc_thermodynamics=False`` for cross-section-only studies.
 
         Returns
         -------
         PhysicsData
             Calculated result in the declared return type.
         """
-        thermo = self._extract_thermodynamics(engine)
+        thermo = self._thermodynamics_for(engine, kwargs.get("calc_thermodynamics", True))
         diff = DifferentialData()
         integ = IntegralData()
         
@@ -268,7 +268,6 @@ class NCrystalParser(BaseTslParser):
         regeneration is performed. Gn remains a solid-like VDOS diagnostic.
         """
         state = engine.liquid_data
-        kernel = state.kernels[engine.target_lbl]
         if kwargs.get('calc_gn', False):
             energy, density = self._kernel_vdos(engine)
             gn_energy, gn = extractGn(vdos=(energy, density),
@@ -278,6 +277,9 @@ class NCrystalParser(BaseTslParser):
         flags = self._requested_outputs(kwargs)
         if not kwargs.get('calc_sab', False) and not any(flags.values()):
             return
+        if engine.target_lbl not in state.kernels:
+            raise ValueError("Liquid kernel data are unavailable. Enable capture_kernel in the runner.")
+        kernel = state.kernels[engine.target_lbl]
         if any(flags.values()):
             energies = np.atleast_1d(kwargs.get('ein_arr', [0.0253])).astype(float)
             if (not np.isfinite(energies).all() or np.any(energies <= 0)

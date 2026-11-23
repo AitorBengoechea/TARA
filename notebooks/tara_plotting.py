@@ -18,6 +18,8 @@ from scipy import stats
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import FormatStrFormatter, FuncFormatter
 
+from core.data.material_scattering import MaterialScatteringModel
+
 
 _XS_LABELS = {
     "xs_total": "Total scattering cross section",
@@ -29,7 +31,20 @@ _XS_LABELS = {
 
 
 def _spectrum_xy(spectrum):
-    """Return numeric PDOS coordinates from a TARA spectrum or a Series."""
+    """Return numeric PDOS coordinates from a spectrum or material.
+
+    Parameters
+    ----------
+    spectrum : PhononSpectra, MaterialScatteringModel, or pandas.Series
+        Vibrational input, or material whose continuous spectrum is displayed.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Energy in eV and density in inverse eV.
+    """
+    if isinstance(spectrum, MaterialScatteringModel):
+        spectrum = spectrum.dynamics.continuous
     if isinstance(spectrum, pd.Series):
         return (spectrum.index.to_numpy(dtype=float),
                 spectrum.to_numpy(dtype=float))
@@ -2375,7 +2390,6 @@ def plot_water_PDOS(
     *,
     oscillators=None,
     ref_label="Reference",
-    bands=None,
 ):
     """Plot the water spectrum in three panels with independent y-axes.
 
@@ -2394,11 +2408,6 @@ def plot_water_PDOS(
         unset for NCrystal water, whose modes are already in the VDOS.
     ref_label : str, default="Reference"
         Label for the reference curve.
-    bands : sequence of tuple, optional
-        Exactly three ``(lower_mev, upper_mev, title)`` entries, in panel
-        order. The limits and titles are used as given, including when
-        oscillators are plotted. None uses the standard water regions
-        and automatically fits the continuum and oscillator panels.
 
     Returns
     -------
@@ -2417,20 +2426,12 @@ def plot_water_PDOS(
         energy, density = _spectrum_xy(spectrum)
         curves.append((energy * 1e3, density / 1e3))
 
-    use_default_bands = bands is None
-    if use_default_bands:
-        bands = (
-            (0.0, 150.0, "Low-energy region"),
-            (195.0, 215.0, "Bending region"),
-            (405.0, 420.0, "Stretching region"),
-        )
-    else:
-        bands = tuple(bands)
-        if len(bands) != 3:
-            raise ValueError("Water PDOS requires exactly three bands.")
-        for lower, upper, _ in bands:
-            if not (np.isfinite(lower) and np.isfinite(upper) and lower < upper):
-                raise ValueError("Each band needs finite, increasing limits in meV.")
+    upper_mev = max(450.0, max(energy[-1] for energy, _ in curves))
+    bands = (
+        (0.0, 150.0, "Low-energy region"),
+        (195.0, 215.0, "Bending region"),
+        (405.0, 420.0, "Stretching region"),
+    )
     modes = (
         None if oscillators is None
         else sorted(oscillators, key=lambda mode: mode.energy_ev)
@@ -2454,20 +2455,15 @@ def plot_water_PDOS(
                 textcoords="offset points",
                 ha="center",
             )
-            # Fit oscillator peaks only when no manual windows were supplied.
-            if use_default_bands:
-                title = ("Bending mode", "Stretching mode")[panel - 1]
-                lower = min(lower, energy_mev - 10)
-                upper = max(upper, energy_mev + 10)
             ax.set(
-                title=title,
-                xlim=(lower, upper),
+                title=("Bending mode", "Stretching mode")[panel - 1],
+                xlim=(min(lower, energy_mev - 10), max(upper, energy_mev + 10)),
                 ylim=(0, 1.25 * mode.weight if mode.weight > 0 else 1),
                 ylabel="Oscillator weight",
             )
         else:
             # Slice the plotted data so each panel autos-scales to its region.
-            if modes is not None and use_default_bands:
+            if modes is not None:
                 upper = max(upper, max(energy[-1] for energy, _ in curves))
                 title = "Low-energy continuum"
 
@@ -2510,7 +2506,6 @@ def plot_water_master_dashboard(
     xs_type="xs_total",
     oscillators=None,
     show_error_inset=False,
-    bands=None,
 ):
     """Plot a three-panel water spectrum and optional cross-section rows.
 
@@ -2535,9 +2530,6 @@ def plot_water_master_dashboard(
         Leave unset for NCrystal water.
     show_error_inset : bool, default=False
         Add the shared relative-difference zoom inset.
-    bands : sequence of tuple, optional
-        Three ``(lower_mev, upper_mev, title)`` entries for the spectrum
-        row, passed to ``plot_water_PDOS``.
 
     Returns
     -------
@@ -2585,7 +2577,6 @@ def plot_water_master_dashboard(
                 ensemble.reference,
                 oscillators=oscillators,
                 ref_label=ref_label,
-                bands=bands,
             )
         elif name == "xs":
             axes[name] = fig.add_subplot(grid[row, :])

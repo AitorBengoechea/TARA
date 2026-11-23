@@ -114,7 +114,7 @@ def calc_cv_numba(pdos: np.ndarray, E: np.ndarray, T: float) -> float:
             # Standard Formula
             kernel[i] = (b * b) * ex / (denom * denom)
 
-    # 4. Integrate using Numba's supported trapezoid
+    # Integrate over the actual phonon energy grid.
     y = pdos * kernel
     return np.trapezoid(y, E)
 
