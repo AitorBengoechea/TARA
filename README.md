@@ -23,7 +23,6 @@ Unlike standard data perturbation tools, TARA is built to strictly enforce the p
 * **B-Spline Amplitude Perturbation:** Introduces smooth, artifact-free amplitude variations without non-physical discontinuities.
 * **Diffeomorphic Peak Shifting:** Utilizes diffeomorphic mapping with precise Jacobian corrections to continuously shift energy or momentum transfer peaks while conserving reaction probabilities and phase-space integrals.
 * **Coupled & Uncoupled UQ:** Supports both independent parameter sampling and the introduction of synthetic correlations between amplitude cross-sections and peak positions.
-* **Automated Physical Filtering:** Features a rigorous topological filtering pipeline to automatically reject mathematically successful but physically invalid scattering laws.
 
 ---
 
