@@ -1,0 +1,45 @@
+# Graphite via LEAPR and NJOY. Relative file paths start at this TOML directory.
+
+[workflow]
+backend = "njoy"
+
+[material]
+base_endf_file = "../../tests/fixtures/n_6-C-012g.jeff"
+leapr_file = "../../tests/fixtures/input_2.leapr"
+temperature_k = 296.0  # First tabulated temperature in input_2.leapr.
+
+[output]
+directory = "../../tara_output/ace_njoy/cli_solid"
+
+[ensemble]
+n_samples = 3
+include_reference = true  # sample_000 is the reference, sample_001 is ensemble[0].
+random_seed = 20261008
+batch_size = 512
+
+[execution]
+n_jobs = 1               # -1 = HPC-aware maximum, or a positive integer.
+njoy_executable = "njoy"  # PATH executable, or an absolute file path.
+
+[sampling]
+max_energy_shift_mev = 1.0
+max_amplitude_shift_pct = 5.0
+grid_partition_method = "automatic"  # automatic / manual
+automatic_partition_prominence_pct = 1.0  # Lower values detect more valleys; automatic only.
+manual_energy_ranges = []            # Manual only: [[0.0, 0.06], [0.06, 0.12]] in eV.
+domain_splitting_strategy = "fixed"  # fixed / deterministic / random
+correlation_strategy = "independent" # independent / random_group
+variable_coupling = "independent"    # independent / coupled
+shared_grid_structure = true
+freeze_origin = true
+fast_amplitude = true
+amplitude_method = "fast"             # fast / precise
+spatial_method = "diffeomorphic"     # diffeomorphic / crossfade
+auto_normalize = true
+
+[ace]
+max_energy_ev = 5.0
+suffix = ".01"
+nbin = 16
+tolerance = 0.001
+save_xsdir = true
