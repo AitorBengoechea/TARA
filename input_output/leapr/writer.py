@@ -117,25 +117,50 @@ class LeaprWriter:
         """
         self._write_control_line(f, [block['delta'], block['ni']])
         self._write_data_block(f, block['phonon_spectrum'], items_per_line=4)
-        
+
         card13_data = [block['twt'], block['c'], block['tbeta']]
         if '_opt4' in block:
             card13_data.append(block['_opt4'])
         self._write_control_line(f, card13_data)
-        
+
+        self._write_oscillator_cards(f, block)
+        nsk = self.leapr.principal_scatterer.get('nsk', 0)
+        if nsk > 0:
+            self._write_structure_factor_cards(f, block, nsk)
+
+    def _write_oscillator_cards(self, f: TextIO, block: Dict[str, Any]) -> None:
+        """Write the oscillator count and the arrays for active discrete modes.
+
+        Parameters
+        ----------
+        f : TextIO
+            Output stream positioned at Card 14.
+        block : dict
+            Temperature block containing the oscillator count, energies, and weights.
+        """
         nd = block['nd']
         self._write_control_line(f, [nd])
-        
+
         if nd > 0:
             self._write_data_block(f, block.get('oscillator_energies', []), items_per_line=5)
             self._write_data_block(f, block.get('oscillator_weights', []), items_per_line=5)
-            
-        nsk = self.leapr.principal_scatterer.get('nsk', 0)
-        if nsk > 0:
-            self._write_control_line(f, [block['nka'], block['dka']])
-            self._write_data_block(f, block.get('static_structure_factor', []), items_per_line=5)
-            if nsk == 2:
-                self._write_control_line(f, [block.get('coherent_scattering_fraction', 0.0)])
+
+    def _write_structure_factor_cards(self, f: TextIO, block: Dict[str, Any], nsk: int) -> None:
+        """Write the static structure-factor grid, values, and any coherent fraction.
+
+        Parameters
+        ----------
+        f : TextIO
+            Output stream positioned at Card 17.
+        block : dict
+            Temperature block containing the structure-factor data.
+        nsk : int
+            LEAPR structure-factor option from the principal scatterer card.
+        """
+        self._write_control_line(f, [block['nka'], block['dka']])
+        self._write_data_block(f, block.get('static_structure_factor', []), items_per_line=5)
+        if nsk == 2:
+            self._write_control_line(f, [block.get('coherent_scattering_fraction', 0.0)])
 
     def _write_footer(self, f: TextIO) -> None:
         """

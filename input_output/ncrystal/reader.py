@@ -159,64 +159,99 @@ class NCrystalReader:
         Returns
         -------
         Dict[str, Any]
-            Results associated with their sample, energy, or field identifiers.
+            Parsed dynamics fields, optional energy and density arrays, and original lines.
         """
-        dyn_dict: Dict[str, Any] = {'raw_lines': lines}  # Preserve exact lines for writer
+        dyn_dict, vdos_values = self._read_dyninfo_fields(lines)
+
+        if vdos_values:
+            dyn_dict['vdos'] = np.array(vdos_values, dtype=np.float64)
+            if 'egrid_params' in dyn_dict:
+                dyn_dict['egrid'] = self._dyninfo_energy_grid(
+                    dyn_dict['egrid_params'], len(vdos_values),
+                )
+
+        return dyn_dict
+
+    @staticmethod
+    def _read_dyninfo_fields(lines: List[str]) -> tuple[Dict[str, Any], list[float]]:
+        """Read DYNINFO metadata and collect wrapped VDOS values.
+
+        Parameters
+        ----------
+        lines : list of str
+            Original lines in one DYNINFO block.
+
+        Returns
+        -------
+        tuple of dict and list of float
+            Parsed fields with the original lines, and expanded density values.
+        """
+        # Retain the original block for lossless writing when it is unchanged.
+        dyn_dict: Dict[str, Any] = {'raw_lines': lines}
         in_vdos = False
         vdos_values = []
         
         for line in lines:
             lower_line = line.lower()
             
-            # Continue collecting VDOS numbers if we are inside the array
+            # Unlabelled continuation lines belong to the active VDOS block.
             if in_vdos and not lower_line.startswith(('element', 'fraction', 'type', 'temperature', 'vdos')):
-                # Extract NCMAT VDOS numeric values independently of their line wrapping.
                 vdos_values.extend(expand_ncmat_array_values(line))
                 continue
                 
             if lower_line.startswith('element'):
-                # Tokenize this NCMAT record before mapping its values to a structured field.
                 dyn_dict['element'] = line.split()[1]
             elif lower_line.startswith('fraction'):
-                # Tokenize this NCMAT record before mapping its values to a structured field.
                 dyn_dict['fraction'] = line.split()[1]
             elif lower_line.startswith('type'):
-                # Tokenize this NCMAT record before mapping its values to a structured field.
                 dyn_dict['type'] = line.split()[1]
             elif lower_line.startswith('temperature'):
-                # Tokenize this NCMAT record before mapping its values to a structured field.
                 dyn_dict['temperature'] = line.split()[1]
             elif lower_line.startswith('vdos_egrid'):
-                # Extract NCMAT VDOS numeric values independently of their line wrapping.
                 dyn_dict['egrid_params'] = extract_floats(line)
             elif lower_line.startswith('vdos_density'):
                 in_vdos = True
-                # Extract NCMAT VDOS numeric values independently of their line wrapping.
                 vdos_values.extend(expand_ncmat_array_values(line.split('vdos_density', 1)[1]))
             elif lower_line.startswith('vdos'):
                 in_vdos = True
             elif 'egrid' in lower_line and 'vdos_egrid' not in lower_line:
-                # Extract NCMAT VDOS numeric values independently of their line wrapping.
                 dyn_dict['egrid_params'] = extract_floats(line)
                 
-        if vdos_values:
-            # Retain the native VDOS numeric samples in a contiguous floating-point array.
-            dyn_dict['vdos'] = np.array(vdos_values, dtype=np.float64)
-            if 'egrid_params' in dyn_dict:
-                ep = dyn_dict['egrid_params']
-                if len(ep) == 3:
-                    if not float(ep[2]).is_integer() or int(ep[2]) != len(vdos_values):
-                        raise NCrystalFormatError(
-                            "NCMAT VDOS grid count disagrees with expanded density length"
-                        )
-                    dyn_dict['egrid'] = np.linspace(ep[0], ep[1], int(ep[2]))
-                elif len(ep) == 2:
-                    # Native 2-parameter VDOS grid uses the EXPANDED point count.
-                    dyn_dict['egrid'] = np.linspace(ep[0], ep[1], len(vdos_values))
-                else:
-                    raise NCrystalFormatError("NCMAT VDOS needs 2 or 3 grid parameters")
-                    
-        return dyn_dict
+        return dyn_dict, vdos_values
+
+
+    @staticmethod
+    def _dyninfo_energy_grid(params, density_count: int) -> np.ndarray:
+        """Expand NCMAT grid bounds using the parsed density count.
+
+        Parameters
+        ----------
+        params : sequence of float
+            Energy bounds in eV and optional point count.
+        density_count : int
+            Number of density values after expanding repetition tokens.
+
+        Returns
+        -------
+        numpy.ndarray
+            Uniform NCMAT energy grid in eV.
+
+        Raises
+        ------
+        NCrystalFormatError
+            If the grid entry has the wrong size or declares an inconsistent point count.
+        """
+        if len(params) == 3:
+            if not float(params[2]).is_integer() or int(params[2]) != density_count:
+                raise NCrystalFormatError(
+                    "NCMAT VDOS grid count disagrees with expanded density length"
+                )
+            return np.linspace(params[0], params[1], int(params[2]))
+        if len(params) == 2:
+            # The two-value syntax omits the number of expanded density points.
+            return np.linspace(params[0], params[1], density_count)
+        raise NCrystalFormatError("NCMAT VDOS needs 2 or 3 grid parameters")
+
 
     def _parse_float_array(self, lines: List[str]) -> np.ndarray:
         """Extracts a flat numpy array from multiline text blocks.
@@ -229,7 +264,7 @@ class NCrystalReader:
         Returns
         -------
         np.ndarray
-            Numerical array evaluated on the corresponding coordinate grid.
+            Flat array in source order with repetition tokens expanded.
         """
         all_floats = []
         for line in lines:

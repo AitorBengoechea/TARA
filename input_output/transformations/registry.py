@@ -6,7 +6,18 @@ _ADAPTERS = {}
 
 
 def register_adapter(adapter):
-    """Register an adapter instance with .engine, .suffixes, .extract, .replace."""
+    """Register a native input adapter for its supported extensions.
+
+    Parameters
+    ----------
+    adapter : object
+        Adapter providing the engine, suffixes, and extraction and replacement methods.
+
+    Raises
+    ------
+    InputTransformationError
+        If an extension already belongs to a different adapter.
+    """
     for suffix in adapter.suffixes:
         key = suffix.lower()
         if key in _ADAPTERS and _ADAPTERS[key] is not adapter:

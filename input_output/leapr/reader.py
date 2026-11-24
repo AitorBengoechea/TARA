@@ -71,10 +71,9 @@ class LeaprReader:
         self._parse_card_5_principal_scatterer(f)
         self._parse_card_6_secondary_scatterer(f)
         self._parse_card_7_grid_params(f)
-        
-        # Read the next LEAPR numerical block using the format-specific low-level parser.
+
+        # Cards 8 and 9 provide the alpha and beta grids in that order.
         self.leapr.alpha_grid = np.array(read_data_block(f), dtype=np.float64)
-        # Read the next LEAPR numerical block using the format-specific low-level parser.
         self.leapr.beta_grid = np.array(read_data_block(f), dtype=np.float64)
 
     def _read_temp_blocks(self, f: TextIO) -> None:
@@ -145,30 +144,67 @@ class LeaprReader:
         
         block.update(self._parse_card_13_translational(f))
         
+        block.update(self._read_oscillator_cards(f))
+
+        if nsk > 0:
+            block.update(self._read_structure_factor_cards(f, nsk))
+
+        return block
+
+    def _read_oscillator_cards(self, f: TextIO) -> Dict[str, Any]:
+        """Read the oscillator count and optional energies and weights.
+
+        Parameters
+        ----------
+        f : TextIO
+            Input stream positioned at Card 14.
+
+        Returns
+        -------
+        dict
+            Oscillator count and any accompanying arrays.
+        """
+        block: Dict[str, Any] = {}
         nd = self._parse_card_14_oscillator_control(f)
         block['nd'] = nd
 
         if nd > 0:
-            # Read the next LEAPR numerical block using the format-specific low-level parser.
+            # Card 14 specifies the number of entries in both arrays.
             block['oscillator_energies'] = np.array(
                 read_fixed_length_array(f, nd, card='Card 15 oscillator energies'),
                 dtype=np.float64,
             )
-            # Read the next LEAPR numerical block using the format-specific low-level parser.
             block['oscillator_weights'] = np.array(
                 read_fixed_length_array(f, nd, card='Card 16 oscillator weights'),
                 dtype=np.float64,
             )
 
-        if nsk > 0:
-            nka, dka = self._parse_card_17_structure_factor_control(f)
-            block['nka'] = nka
-            block['dka'] = dka
-            # Read the next LEAPR numerical block using the format-specific low-level parser.
-            block['static_structure_factor'] = np.array(read_data_block(f), dtype=np.float64)
-            if nsk == 2:
-                block['coherent_scattering_fraction'] = self._read_control_line_floats(f)[0]
-        
+        return block
+
+    def _read_structure_factor_cards(self, f: TextIO, nsk: int) -> Dict[str, Any]:
+        """Read static structure-factor data and any coherent fraction.
+
+        Parameters
+        ----------
+        f : TextIO
+            Input stream positioned at Card 17.
+        nsk : int
+            Source static structure-factor option.
+
+        Returns
+        -------
+        dict
+            Structure-factor grid, values, and optional coherent fraction.
+        """
+        block: Dict[str, Any] = {}
+        nka, dka = self._parse_card_17_structure_factor_control(f)
+        block['nka'] = nka
+        block['dka'] = dka
+        block['static_structure_factor'] = np.array(read_data_block(f), dtype=np.float64)
+        # LEAPR includes a separate coherent fraction only for NSK=2.
+        if nsk == 2:
+            block['coherent_scattering_fraction'] = self._read_control_line_floats(f)[0]
+
         return block
 
     def _read_footer(self, f: TextIO) -> None:

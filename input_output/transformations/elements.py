@@ -132,7 +132,23 @@ ATOMIC_MASS_AMU = {
 }
 
 def parse_pdos_parameter(parameter):
-    """Resolve e.g. C_pdos, O_pdos, H_pdos to their valid element label."""
+    """Resolve a VDOS parameter name to its supported element label.
+
+    Parameters
+    ----------
+    parameter : str
+        Selector of the form `<element>_pdos`.
+
+    Returns
+    -------
+    str
+        Element symbol from the atomic mass table.
+
+    Raises
+    ------
+    InputTransformationError
+        If the selector or element label is unsupported.
+    """
     if not isinstance(parameter, str) or not parameter.endswith("_pdos"):
         raise InputTransformationError(f"Unsupported parameter {parameter!r}; expected <element>_pdos.")
     element = parameter[:-5]
@@ -141,10 +157,21 @@ def parse_pdos_parameter(parameter):
     return element
 
 def principal_matches_element(awr, element, rtol=0.015):
-    """Require plausible natural atomic weight AND unambiguous AWR identity.
+    """Verify that a LEAPR mass ratio unambiguously identifies an element.
 
-    LEAPR gives relative atomic mass, not an element symbol. Isotope/effective
-    masses or closely spaced elemental masses are not safely inferable.
+    Parameters
+    ----------
+    awr : float
+        Principal scatterer mass relative to the neutron mass.
+    element : str
+        Expected element symbol.
+    rtol : float, optional
+        Maximum relative mass difference. Default is 0.015.
+
+    Raises
+    ------
+    InputTransformationError
+        If the mass is incompatible with the element or has multiple matches.
     """
     expected = ATOMIC_MASS_AMU[element] / NEUTRON_MASS_AMU
     error = abs(awr - expected) / expected

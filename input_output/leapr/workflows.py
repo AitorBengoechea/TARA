@@ -55,6 +55,36 @@ def plot_spectrum(leapr_file: LeaprFile, save_path: Optional[str] = None) -> Non
         plt.show()
 
 
+def _require_reference_grid(
+    leapr_file: LeaprFile,
+    *,
+    error_message: str = "Energy grid not loaded. Cannot interpolate.",
+) -> np.ndarray:
+    """Require the energy grid of the first positive-temperature block.
+
+    Parameters
+    ----------
+    leapr_file : LeaprFile
+        Parsed LEAPR template.
+    error_message : str, optional
+        Diagnostic to use when the grid is missing.
+
+    Returns
+    -------
+    numpy.ndarray
+        Reference energy grid in eV.
+
+    Raises
+    ------
+    LeaprFormatError
+        If the reference energy grid has not been loaded.
+    """
+    grid = leapr_file.first_positive_energy_grid
+    if grid is None:
+        raise LeaprFormatError(error_message)
+    return grid
+
+
 def interpolate_spectrum(leapr_file: LeaprFile, 
                          input_energy_axis: np.ndarray, 
                          input_spectrum_values: np.ndarray) -> np.ndarray:
@@ -80,12 +110,9 @@ def interpolate_spectrum(leapr_file: LeaprFile,
     LeaprFormatError
         If the `first_positive_energy_grid` of the LeaprFile is not loaded.
     """
-    if leapr_file.first_positive_energy_grid is None:
-        raise LeaprFormatError(
-            "LeaprFile `first_positive_energy_grid` is not loaded."
-        )
-    
-    target_energy_axis = leapr_file.first_positive_energy_grid
+    target_energy_axis = _require_reference_grid(
+        leapr_file, error_message="LeaprFile `first_positive_energy_grid` is not loaded."
+    )
     interpolated_spectrum = np.interp(
         target_energy_axis,
         input_energy_axis,
@@ -227,7 +254,7 @@ def inject_leapr_spectrum(
     Raises
     ------
     LeaprFormatError
-        If the input or required state violates the operation contract.
+        If the template lacks the needed grid or the sampled spectrum cannot be exported.
     """
     writer = prepare_leapr_spectrum(
         leapr_obj, spectrum, export_full_spectra=export_full_spectra,
@@ -239,6 +266,127 @@ def inject_leapr_spectrum(
             leapr_obj.first_positive_energy_grid = writer.first_positive_energy_grid
             leapr_obj.__dict__.pop('pdos', None)
             return
+
+
+def _select_export_block(leapr_file, temperature, warn_on_temperature_reuse, preserve_temperature_parameters):
+    """Select the source block and the temperature to serialize.
+
+    Parameters
+    ----------
+    leapr_file : LeaprFile
+        Parsed LEAPR template.
+    temperature : float or None
+        Requested temperature in kelvin.
+    warn_on_temperature_reuse : bool
+        Warn if the legacy reuse rule selects the first spectrum.
+    preserve_temperature_parameters : bool
+        Require an exact source temperature even without discrete modes.
+
+    Returns
+    -------
+    tuple of dict and float
+        Source block and output temperature in kelvin.
+    """
+    has_source_modes = any(
+        int(b.get('vibrational_source', b).get('nd', 0)) > 0
+        for b in leapr_file.temp_blocks
+    )
+    if preserve_temperature_parameters or has_source_modes:
+        source_block, output_temperature = select_leapr_temperature_block(
+            leapr_file, temperature,
+        )
+    else:
+        source_block = next(
+            (block for block in leapr_file.temp_blocks if block['temp'] > 0), None,
+        )
+        if source_block is None:
+            raise LeaprFormatError('No positive temperature block found in LEAPR template.')
+        output_temperature = resolve_leapr_temperature(
+            leapr_file, temperature, warn_on_reuse=warn_on_temperature_reuse,
+        )
+    return source_block, output_temperature
+
+
+def _prepare_continuous_export_block(source_block, spectrum):
+    """Prepare continuous LEAPR metadata for an already reconstructed spectrum.
+
+    Parameters
+    ----------
+    source_block : dict
+        Selected LEAPR temperature block.
+    spectrum : PhononSpectra
+        Sampled full vibrational spectrum.
+
+    Returns
+    -------
+    dict
+        Block with the grid and weights for continuous export.
+
+    Raises
+    ------
+    LeaprFormatError
+        If the sampled energy support misses an original mode.
+    """
+    # A sampled curve already contains the modes: only change the output
+    # representation here, never add the original modes a second time.
+    if int(source_block.get('nd', 0)) > 0:
+        if spectrum.energy_grid[-1] < max(source_block['oscillator_energies']):
+            raise LeaprFormatError('Expected a full vibrational spectrum including discrete modes.')
+
+        # Prefer the incoming grid when it already resolves the modes.
+        grid = spectrum.energy_grid
+        spacing = float(grid[1])
+        if (spacing <= DEFAULT_OSCILLATOR_SIGMA_EV / 3.0 * (1.0 + 1e-12)
+                and np.allclose(np.diff(grid), spacing, rtol=1e-8, atol=1e-12)):
+            source_block = copy.deepcopy(source_block)
+            source_block.update(
+                nd=0, oscillator_energies=np.array([]), oscillator_weights=np.array([]),
+                tbeta=float(source_block['tbeta']) + sum(source_block['oscillator_weights']),
+                vibrational_source=copy.deepcopy(source_block),
+                delta=spacing, ni=len(grid),
+            )
+        else:
+            # Reconstruct only to obtain output metadata and the fine grid.
+            # The sampled density replaces the prepared reference below.
+            source_block = tabulate_vibrational_block(source_block)
+    return source_block
+
+
+def _prepare_export_grid(source_block, spectrum, output_spacing_ev):
+    """Resolve the LEAPR output grid and propagate any spacing override.
+
+    Parameters
+    ----------
+    source_block : dict
+        LEAPR block providing default spacing and size.
+    spectrum : PhononSpectra
+        Spectrum whose support must fit on the grid.
+    output_spacing_ev : float or None
+        Explicit output grid step, if supplied.
+
+    Returns
+    -------
+    tuple of dict and numpy.ndarray
+        Block metadata and target energy grid in eV.
+
+    Raises
+    ------
+    ValueError
+        If the requested spacing is invalid.
+    """
+    target_grid = np.arange(int(source_block['ni'])) * float(source_block['delta'])
+    if output_spacing_ev is not None:
+        spacing = float(output_spacing_ev)
+        if not np.isfinite(spacing) or spacing <= 0.0:
+            raise ValueError("LEAPR output spacing must be positive and finite.")
+        upper = max(target_grid[-1], spectrum.energy_grid[-1])
+        last_index = max(1, int(np.ceil(upper / spacing - 1e-12)))
+        target_grid = np.arange(last_index + 1, dtype=float) * spacing
+        source_block = {**source_block, 'delta': spacing}
+    target_grid, _ = resample_on_source_spacing(
+        target_grid, spectrum.energy_grid, spectrum.density_values,
+    )
+    return source_block, target_grid
 
 
 def prepare_leapr_spectrum(
@@ -281,33 +429,18 @@ def prepare_leapr_spectrum(
     Returns
     -------
     LeaprFile
-        Calculated result in the declared return type.
+        Writer copy with the sampled spectrum and its selected temperature.
 
     Raises
     ------
     LeaprFormatError
-        If the input or required state violates the operation contract.
+        If the template lacks the needed grid or the sampled spectrum cannot be exported.
     """
-    if leapr_file.first_positive_energy_grid is None:
-        raise LeaprFormatError("Energy grid not loaded. Cannot interpolate.")
+    _require_reference_grid(leapr_file)
 
-    has_source_modes = any(
-        int(b.get('vibrational_source', b).get('nd', 0)) > 0
-        for b in leapr_file.temp_blocks
+    source_block, output_temperature = _select_export_block(
+        leapr_file, temperature, warn_on_temperature_reuse, preserve_temperature_parameters,
     )
-    if preserve_temperature_parameters or has_source_modes:
-        source_block, output_temperature = select_leapr_temperature_block(
-            leapr_file, temperature,
-        )
-    else:
-        source_block = next(
-            (block for block in leapr_file.temp_blocks if block['temp'] > 0), None,
-        )
-        if source_block is None:
-            raise LeaprFormatError('No positive temperature block found in LEAPR template.')
-        output_temperature = resolve_leapr_temperature(
-            leapr_file, temperature, warn_on_reuse=warn_on_temperature_reuse,
-        )
     native_block = source_block.get('vibrational_source', source_block)
     if not export_full_spectra and int(native_block.get('nd', 0)) > 0:
         if output_spacing_ev is not None:
@@ -318,45 +451,54 @@ def prepare_leapr_spectrum(
             leapr_file, result, result['phonon_spectrum'], kwargs,
             temperature=output_temperature,
         )
-    # A sampled curve already contains the modes: only change the output
-    # representation here, never add the original modes a second time.
-    if int(source_block.get('nd', 0)) > 0:
-        if spectrum.energy_grid[-1] < max(source_block['oscillator_energies']):
-            raise LeaprFormatError('Expected a full vibrational spectrum including discrete modes.')
-        # Prefer the incoming grid when it already resolves the modes.
-        grid = spectrum.energy_grid
-        spacing = float(grid[1])
-        if (spacing <= DEFAULT_OSCILLATOR_SIGMA_EV / 3.0 * (1.0 + 1e-12)
-                and np.allclose(np.diff(grid), spacing, rtol=1e-8, atol=1e-12)):
-            source_block = copy.deepcopy(source_block)
-            source_block.update(
-                nd=0, oscillator_energies=np.array([]), oscillator_weights=np.array([]),
-                tbeta=float(source_block['tbeta']) + sum(source_block['oscillator_weights']),
-                vibrational_source=copy.deepcopy(source_block),
-                delta=spacing, ni=len(grid),
-            )
-        else:
-            # Reconstruct only to obtain output metadata and the fine grid.
-            # The sampled density replaces the prepared reference below.
-            source_block = tabulate_vibrational_block(source_block)
-    target_grid = np.arange(int(source_block['ni'])) * float(source_block['delta'])
-    if output_spacing_ev is not None:
-        spacing = float(output_spacing_ev)
-        if not np.isfinite(spacing) or spacing <= 0.0:
-            raise ValueError("LEAPR output spacing must be positive and finite.")
-        upper = max(target_grid[-1], spectrum.energy_grid[-1])
-        last_index = max(1, int(np.ceil(upper / spacing - 1e-12)))
-        target_grid = np.arange(last_index + 1, dtype=float) * spacing
-        source_block = {**source_block, 'delta': spacing}
-    target_grid, _ = resample_on_source_spacing(
-        target_grid, spectrum.energy_grid, spectrum.density_values,
-    )
+    source_block = _prepare_continuous_export_block(source_block, spectrum)
+    source_block, target_grid = _prepare_export_grid(source_block, spectrum, output_spacing_ev)
     interpolated = _interpolate_and_normalize(leapr_file, spectrum, target_grid)
     first_pos_template = copy.deepcopy(source_block)
     return _create_first_writer_copy(
         leapr_file, first_pos_template, interpolated, kwargs,
         temperature=output_temperature,
     )
+
+
+def _validate_material_for_export(
+    model: MaterialScatteringModel,
+    leapr_file: LeaprFile,
+    temperature: float | None,
+) -> float:
+    """Check the sampled material against the LEAPR export requirements.
+
+    Parameters
+    ----------
+    model : MaterialScatteringModel
+        Sampled liquid material with tabulated vibrational dynamics.
+    leapr_file : LeaprFile
+        Source template that supplies the principal scatterer mass ratio.
+    temperature : float or None
+        Requested output temperature in kelvin. Defaults to the model temperature.
+
+    Returns
+    -------
+    float
+        Output temperature in kelvin, consistent with the material model.
+
+    Raises
+    ------
+    ValueError
+        If the model is not liquid, the temperature or mass ratio is
+        inconsistent, or the model still contains discrete oscillators.
+    """
+    if model.state != "liquid":
+        raise ValueError("Material serializer requires liquid state.")
+    target_temperature = model.temperature_k if temperature is None else temperature
+    if not np.isclose(target_temperature, model.temperature_k, rtol=0, atol=1e-8):
+        raise ValueError("Material temperature must match LEAPR output temperature.")
+    template_mass_ratio = float(leapr_file.principal_scatterer['awr'])
+    if not np.isclose(model.principal.mass_ratio, template_mass_ratio, rtol=1e-9):
+        raise ValueError("Sampled material principal mass differs from LEAPR template.")
+    if model.dynamics.oscillators:
+        raise ValueError('Tabulate discrete modes before serializing sampled LEAPR material.')
+    return target_temperature
 
 
 def prepare_leapr_material(
@@ -381,16 +523,15 @@ def prepare_leapr_material(
     -------
     LeaprFile
         Sample-specific independent writer copy.
+
+    Raises
+    ------
+    ValueError
+        If the model is incompatible with the template or output temperature.
+    LeaprFormatError
+        If the template or spectrum cannot be exported.
     """
-    if model.state != "liquid":
-        raise ValueError("Material serializer requires liquid state.")
-    target_temperature = model.temperature_k if temperature is None else temperature
-    if not np.isclose(target_temperature, model.temperature_k, rtol=0, atol=1e-8):
-        raise ValueError("Material temperature must match LEAPR output temperature.")
-    if not np.isclose(model.principal.mass_ratio, float(leapr_file.principal_scatterer['awr']), rtol=1e-9):
-        raise ValueError("Sampled material principal mass differs from LEAPR template.")
-    if model.dynamics.oscillators:
-        raise ValueError('Tabulate discrete modes before serializing sampled LEAPR material.')
+    target_temperature = _validate_material_for_export(model, leapr_file, temperature)
     writer = prepare_leapr_spectrum(
         leapr_file, model.dynamics.continuous, temperature=target_temperature,
         warn_on_temperature_reuse=False, preserve_temperature_parameters=True,
@@ -414,11 +555,29 @@ def serialize_leapr_material(
     temperature: Optional[float] = None,
     export_full_spectra: bool = False,
 ) -> str:
-    """Serialize sampled liquid dynamics without changing the source template."""
+    """Serialize a sampled liquid material using a LEAPR template.
+
+    Parameters
+    ----------
+    leapr_file : LeaprFile
+        Source material template.
+    model : MaterialScatteringModel
+        Sampled vibrational and translation dynamics.
+    temperature : float or None, optional
+        Output temperature in kelvin.
+    export_full_spectra : bool, optional
+        Encode all vibrational modes on the continuous grid when True.
+
+    Returns
+    -------
+    str
+        Serialized single-temperature LEAPR module.
+    """
     writer = prepare_leapr_material(
         leapr_file, model, temperature=temperature, export_full_spectra=export_full_spectra,
     )
-    return LeaprWriter(writer).to_string()
+    serializer = LeaprWriter(writer)
+    return serializer.to_string()
 
 
 def serialize_leapr_spectrum(
@@ -468,7 +627,26 @@ def serialize_leapr_spectrum(
         preserve_temperature_parameters=preserve_temperature_parameters,
         output_spacing_ev=output_spacing_ev, export_full_spectra=export_full_spectra, **kwargs,
     )
-    return LeaprWriter(writer_copy).to_string()
+    writer = LeaprWriter(writer_copy)
+    return writer.to_string()
+
+def _validate_batch_template(leapr_file: LeaprFile) -> None:
+    """Require the source grid and temperature blocks for batch export.
+
+    Parameters
+    ----------
+    leapr_file : LeaprFile
+        Parsed source template for the batch.
+
+    Raises
+    ------
+    LeaprFormatError
+        If the reference grid or temperature blocks are missing.
+    """
+    _require_reference_grid(leapr_file)
+    if not leapr_file.temp_blocks:
+        raise LeaprFormatError("Temperature blocks not loaded. Cannot write file.")
+
 
 def write_multiple_spectra(leapr_file: LeaprFile,
                            spectra_matrix: pd.DataFrame,
@@ -495,7 +673,7 @@ def write_multiple_spectra(leapr_file: LeaprFile,
         The directory to write the new files into. Defaults to ".".
     temperature : float or None, optional
         Requested output temperature, subject to the original template range.
-    **kwargs :
+    **kwargs : dict
         Optional keyword arguments passed to `get_writer_copy()`
         to modify the *base properties* of all output files.
 
@@ -504,10 +682,7 @@ def write_multiple_spectra(leapr_file: LeaprFile,
     LeaprFormatError
         If the necessary temperature blocks or energy grids are missing.
     """
-    if leapr_file.first_positive_energy_grid is None:
-        raise LeaprFormatError("Energy grid not loaded. Cannot interpolate.")
-    if not leapr_file.temp_blocks:
-        raise LeaprFormatError("Temperature blocks not loaded. Cannot write file.")
+    _validate_batch_template(leapr_file)
     if spectra_matrix.empty:
         print("Warning: Empty spectra_matrix provided. No files written.", file=sys.stderr)
         return

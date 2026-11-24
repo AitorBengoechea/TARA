@@ -179,6 +179,47 @@ class NCrystalFile(BaseFormatFile):
         new_copy.raw_blocks = copy.deepcopy(self.raw_blocks)
         return new_copy
 
+    @staticmethod
+    def _compare_dyninfo(
+        first: List[Dict[str, Any]],
+        second: List[Dict[str, Any]],
+    ) -> bool:
+        """Compare NCMAT dynamic-information blocks.
+
+        NumPy arrays are compared using ``np.allclose`` with its
+        default tolerances. Other values require exact equality.
+
+        Parameters
+        ----------
+        first : list of dict
+            Dynamic-information blocks from the first NCMAT object.
+        second : list of dict
+            Dynamic-information blocks from the second NCMAT object.
+
+        Returns
+        -------
+        bool
+            True if the blocks have matching keys and equivalent values.
+        """
+        if len(first) != len(second):
+            return False
+
+        for block_a, block_b in zip(first, second):
+            if set(block_a) != set(block_b):
+                return False
+
+            for key in block_a:
+                value_a = block_a[key]
+                value_b = block_b[key]
+
+                if isinstance(value_a, np.ndarray):
+                    if not np.allclose(value_a, value_b):
+                        return False
+                elif value_a != value_b:
+                    return False
+
+        return True
+
     def __eq__(self, other: object) -> bool:
         """Compare two NCMAT files by their parsed structural content.
 
@@ -210,47 +251,6 @@ class NCrystalFile(BaseFormatFile):
         if not isinstance(other, NCrystalFile):
             return NotImplemented
             
-        # Helper to compare lists of dictionaries with NumPy arrays
-        def _compare_dyninfo(
-            first: List[Dict[str, Any]],
-            second: List[Dict[str, Any]],
-        ) -> bool:
-            """Compare NCMAT dynamic-information blocks.
-
-            NumPy arrays are compared using ``np.allclose`` with its
-            default tolerances. Other values require exact equality.
-
-            Parameters
-            ----------
-            first : list of dict
-                Dynamic-information blocks from the first NCMAT object.
-            second : list of dict
-                Dynamic-information blocks from the second NCMAT object.
-
-            Returns
-            -------
-            bool
-                True if the blocks have matching keys and equivalent values.
-            """
-            if len(first) != len(second):
-                return False
-
-            for block_a, block_b in zip(first, second):
-                if set(block_a) != set(block_b):
-                    return False
-
-                for key in block_a:
-                    value_a = block_a[key]
-                    value_b = block_b[key]
-
-                    if isinstance(value_a, np.ndarray):
-                        if not np.allclose(value_a, value_b):
-                            return False
-                    elif value_a != value_b:
-                        return False
-
-            return True
-
         return (
             self.version == other.version
             and self.density == other.density
@@ -258,7 +258,7 @@ class NCrystalFile(BaseFormatFile):
             and self.cell == other.cell
             and self.spacegroup == other.spacegroup
             and self.atom_positions == other.atom_positions
-            and _compare_dyninfo(self.dyninfo, other.dyninfo)
+            and self._compare_dyninfo(self.dyninfo, other.dyninfo)
             and np.array_equal(self.custom_vdosebins, other.custom_vdosebins)
             and np.array_equal(self.custom_vdos, other.custom_vdos)
             and self.raw_blocks == other.raw_blocks

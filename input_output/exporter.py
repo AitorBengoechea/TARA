@@ -2,9 +2,8 @@
 Unified exporter for serializing TARA ensembles to disk.
 """
 import os
-import numpy as np
 import pandas as pd
-from typing import List, Union, Any
+from typing import Any, List
 
 from input_output.leapr.core import LeaprFile
 from input_output.leapr.workflows import inject_leapr_spectrum
@@ -32,6 +31,11 @@ def export_ensemble(base_obj: BaseFormatFile,
         The prefix for the output filenames.
     export_full_spectra : bool, optional
         Write LEAPR spectra with ND=0 instead of native discrete modes.
+
+    Raises
+    ------
+    TypeError
+        If the template uses an unsupported output format.
     """
     # Create the destination before writing independently named ensemble outputs.
     os.makedirs(output_dir, exist_ok=True)
@@ -87,35 +91,43 @@ def _inject_ncrystal_spectrum(nc_obj: NCrystalFile, spectrum: PhononSpectra) -> 
     nc_obj.custom_vdosebins = spectrum.energy_grid
     nc_obj.custom_vdos = spectrum.density_values
 
+
 def export_ensemble_results(ensemble_data: Any, output_path: str) -> None:
-    """
-    Serializes an EnsemblePhysicsData container into a single hierarchical HDF5 file.
-    
+    """Serialize an ensemble's cross sections and distributions to HDF5.
+
     Parameters
     ----------
     ensemble_data : Any
-        The pure state container. Typed as Any to prevent upward imports from the analyzer domain.
+        Ensemble physics data with DataFrame fields and dictionaries of DataFrames
+        indexed by incident energy.
     output_path : str
-        The destination file path (e.g., 'results.h5').
+        Destination HDF5 file path.
     """
-    # Create the destination before writing independently named ensemble outputs.
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    
+
     with pd.HDFStore(output_path, mode='w') as store:
         for attr_name, attr_value in ensemble_data.__dict__.items():
-            if attr_value is None:
-                continue
-                
-            # 1. Store standard 2D DataFrames (e.g., /xs_inelastic)
+            # Fixed format preserves floating-point column labels.
             if isinstance(attr_value, pd.DataFrame) and not attr_value.empty:
-                # Use format='fixed' to natively support float column names
                 store.put(attr_name, attr_value, format='fixed')
-                
-            # 2. Store Multi-Ein Dictionaries (e.g., /scattering_kernel/ein_0_0253)
             elif isinstance(attr_value, dict):
-                for ein, df in attr_value.items():
-                    if isinstance(df, pd.DataFrame) and not df.empty:
-                        # Replace decimals in the energy float to create safe HDF5 keys
-                        clean_ein = str(ein).replace('.', '_')
-                        hdf5_path = f"{attr_name}/ein_{clean_ein}"
-                        store.put(hdf5_path, df, format='fixed')
+                _write_incident_energy_frames(store, attr_name, attr_value)
+
+
+def _write_incident_energy_frames(store: pd.HDFStore, group: str, frames: dict) -> None:
+    """Store each populated incident-energy table within its HDF5 group.
+
+    Parameters
+    ----------
+    store : pandas.HDFStore
+        Open output store.
+    group : str
+        Name of the result field to use as the HDF5 group.
+    frames : dict
+        DataFrames indexed by incident energy in eV.
+    """
+    for energy, frame in frames.items():
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            # Use an underscore for the decimal point in each node name.
+            energy_key = str(energy).replace('.', '_')
+            store.put(f"{group}/ein_{energy_key}", frame, format='fixed')

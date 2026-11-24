@@ -23,12 +23,12 @@ def detect_format(filepath: Union[str, Path], sniff_limit: int = 50) -> str:
     Returns
     -------
     str
-        Name of the detected external format.
+        One of "ncmat", "leapr", and "csv".
 
     Raises
     ------
     FileNotFoundError
-        If the input or required state violates the operation contract.
+        If the source path is missing or is not a file.
     """
     path = Path(filepath)
     if not path.is_file():

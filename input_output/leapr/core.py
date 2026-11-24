@@ -107,7 +107,7 @@ class LeaprFile(BaseFormatFile):
             )
         return self.vibrational_pdos()
 
-    def vibrational_pdos(self, temperature=None, energy_grid=None) -> pd.Series:
+    def vibrational_pdos(self, temperature: float = None, energy_grid: np.ndarray = None) -> pd.Series:
         """Return the full spectrum at an exact tabulated temperature.
 
         Parameters
@@ -233,47 +233,82 @@ class LeaprFile(BaseFormatFile):
         """
         new_copy = copy.deepcopy(self)
 
-        if filepath is not None:
-            new_copy.filepath = filepath
-        if module_call_line is not None:
-            new_copy.module_call_line = module_call_line
-        if file_units_line is not None:
-            new_copy.file_units_line = file_units_line
-        if title is not None:
-            new_copy.title = title
-        if run_control_params is not None:
-            new_copy.run_control_params = run_control_params
-        if material_info is not None:
-            new_copy.material_info = material_info
-        if principal_scatterer is not None:
-            new_copy.principal_scatterer = principal_scatterer
-        if secondary_scatterer is not None:
-            new_copy.secondary_scatterer = secondary_scatterer
-        if grid_params is not None:
-            new_copy.grid_params = grid_params
-        if alpha_grid is not None:
-            new_copy.alpha_grid = alpha_grid
-        if beta_grid is not None:
-            new_copy.beta_grid = beta_grid
+        overrides = {
+            "filepath": filepath,
+            "module_call_line": module_call_line,
+            "file_units_line": file_units_line,
+            "title": title,
+            "run_control_params": run_control_params,
+            "material_info": material_info,
+            "principal_scatterer": principal_scatterer,
+            "secondary_scatterer": secondary_scatterer,
+            "grid_params": grid_params,
+            "alpha_grid": alpha_grid,
+            "beta_grid": beta_grid,
+            "temp_blocks": temp_blocks,
+            "footer_comments": footer_comments,
+            "stop_card_found": stop_card_found,
+        }
+        for name, value in overrides.items():
+            if value is not None:
+                setattr(new_copy, name, value)
+
         if temp_blocks is not None:
-            new_copy.temp_blocks = temp_blocks
-        if footer_comments is not None:
-            new_copy.footer_comments = footer_comments
-        if stop_card_found is not None:
-            new_copy.stop_card_found = stop_card_found
-            
-        if temp_blocks is not None:
-            new_copy.__dict__.pop('pdos', None)
-            new_copy.first_positive_spectrum = None
-            new_copy.first_positive_energy_grid = None
-            for block in new_copy.temp_blocks:
-                if block['temp'] > 0:
-                    new_copy.first_positive_spectrum = block['phonon_spectrum']
-                    energies = np.arange(block['ni']) * block['delta']
-                    new_copy.first_positive_energy_grid = energies
-                    break
+            new_copy._refresh_reference_spectrum()
 
         return new_copy
+
+    def _refresh_reference_spectrum(self) -> None:
+        """Refresh the reference spectrum after replacing the LEAPR temperature blocks.
+
+        Notes
+        -----
+        Invalidate the cached PDOS and select the first block with a strictly
+        positive temperature in file order. Use its tabulated spectrum and
+        rebuild the energy grid in eV from zero with ``ni`` points spaced by
+        ``delta``. If no block has a positive temperature, set both reference
+        attributes to ``None``.
+        """
+        # A writer copy inherits the cached PDOS until its temperature blocks change.
+        self.__dict__.pop('pdos', None)
+        self.first_positive_spectrum = None
+        self.first_positive_energy_grid = None
+        for block in self.temp_blocks:
+            if block['temp'] > 0:
+                self.first_positive_spectrum = block['phonon_spectrum']
+                energies = np.arange(block['ni']) * block['delta']
+                self.first_positive_energy_grid = energies
+                break
+
+    @staticmethod
+    def _compare_temp_blocks(blocks1: [dict, list], blocks2: [dict, list]) -> bool:
+        """Compare temperature-dependent blocks of two LEAPR inputs.
+
+        Parameters
+        ----------
+        blocks1 : list of dict
+            Temperature-dependent blocks from the first format object.
+        blocks2 : list of dict
+            Temperature-dependent blocks from the second format object.
+
+        Returns
+        -------
+        bool
+            Whether both block lists have matching fields and values.
+        """
+        if len(blocks1) != len(blocks2):
+            return False
+        for b1, b2 in zip(blocks1, blocks2):
+            if set(b1.keys()) != set(b2.keys()):
+                return False
+            for k in b1:
+                if isinstance(b1[k], np.ndarray):
+                    if not np.allclose(b1[k], b2[k], atol=1e-8):
+                        return False
+                else:
+                    if b1[k] != b2[k]:
+                        return False
+        return True
 
     def __eq__(self, other: object) -> bool:
         """Compare two LEAPR files by their parsed structural content.
@@ -308,35 +343,6 @@ class LeaprFile(BaseFormatFile):
         if not isinstance(other, LeaprFile):
             return NotImplemented
 
-        def compare_temp_blocks(blocks1, blocks2):
-            """Compare temperature-dependent blocks of two LEAPR inputs.
-
-            Parameters
-            ----------
-            blocks1 : object
-                Temperature-dependent blocks from the first format object.
-            blocks2 : object
-                Temperature-dependent blocks from the second format object.
-
-            Returns
-            -------
-            bool
-                Whether the requested condition holds.
-            """
-            if len(blocks1) != len(blocks2):
-                return False
-            for b1, b2 in zip(blocks1, blocks2):
-                if set(b1.keys()) != set(b2.keys()):
-                    return False
-                for k in b1:
-                    if isinstance(b1[k], np.ndarray):
-                        if not np.allclose(b1[k], b2[k], atol=1e-8):
-                            return False
-                    else:
-                        if b1[k] != b2[k]:
-                            return False
-            return True
-
         return (
             self.module_call_line == other.module_call_line
             and self.file_units_line == other.file_units_line
@@ -350,5 +356,5 @@ class LeaprFile(BaseFormatFile):
             and np.array_equal(self.beta_grid, other.beta_grid)
             and self.footer_comments == other.footer_comments
             and self.stop_card_found == other.stop_card_found
-            and compare_temp_blocks(self.temp_blocks, other.temp_blocks)
+            and self._compare_temp_blocks(self.temp_blocks, other.temp_blocks)
         )

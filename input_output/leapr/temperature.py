@@ -37,6 +37,29 @@ def available_leapr_temperatures(leapr_file: LeaprFile) -> tuple[float, ...]:
         If the template has no usable first positive-temperature spectrum or
         contains an invalid temperature card.
     """
+    temperatures = _validated_template_temperatures(leapr_file)
+    return tuple(sorted({abs(value) for value in temperatures}))
+
+
+def _validated_template_temperatures(leapr_file: LeaprFile) -> list[float]:
+    """Read and validate the signed temperature cards in template order.
+
+    Parameters
+    ----------
+    leapr_file : LeaprFile
+        Parsed template containing the temperature blocks.
+
+    Returns
+    -------
+    list of float
+        Signed temperature values in kelvin.
+
+    Raises
+    ------
+    LeaprFormatError
+        If a card is invalid, a reuse card precedes its source, or no
+        positive-temperature spectrum is present.
+    """
     temperatures = []
     has_spectrum = False
     for block in leapr_file.temp_blocks:
@@ -53,10 +76,10 @@ def available_leapr_temperatures(leapr_file: LeaprFile) -> tuple[float, ...]:
                 "A negative LEAPR temperature cannot precede the first "
                 "positive-temperature phonon spectrum."
             )
-        temperatures.append(abs(value))
+        temperatures.append(value)
     if not has_spectrum:
         raise LeaprFormatError("LEAPR template contains no positive-temperature spectrum.")
-    return tuple(sorted(set(temperatures)))
+    return temperatures
 
 
 def resolve_leapr_temperature(
@@ -95,25 +118,14 @@ def resolve_leapr_temperature(
         If the request is not finite and positive, or is more than five kelvin
         beyond the original template's temperature boundaries.
     """
-    available = available_leapr_temperatures(leapr_file)
-    original = next(float(block["temp"]) for block in leapr_file.temp_blocks
-                    if float(block["temp"]) > 0.0)
-    try:
-        requested = original if temperature is None else float(temperature)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("Requested LEAPR temperature must be positive and finite.") from exc
-    if not math.isfinite(requested) or requested <= 0.0:
-        raise ValueError("Requested LEAPR temperature must be positive and finite.")
-
-    minimum, maximum = available[0], available[-1]
-    distance_outside = max(minimum - requested, requested - maximum, 0.0)
-    if distance_outside > TEMPERATURE_MARGIN_K:
-        raise ValueError(
-            f"Requested LEAPR temperature {requested:g} K is {distance_outside:g} K "
-            f"outside the original range [{minimum:g}, {maximum:g}] K "
-            f"(maximum permitted overshoot: {TEMPERATURE_MARGIN_K:g} K). "
-            "Edit the input LEAPR template explicitly to use this temperature."
-        )
+    cards = _validated_template_temperatures(leapr_file)
+    original = cards[0]
+    requested = original if temperature is None else _validate_requested_temperature(
+        temperature, "Requested LEAPR temperature must be positive and finite.",
+    )
+    physical_temperatures = [abs(value) for value in cards]
+    minimum, maximum = min(physical_temperatures), max(physical_temperatures)
+    distance_outside = _validate_temperature_range(requested, minimum, maximum)
 
     if warn_on_reuse and not math.isclose(requested, original, abs_tol=1e-10, rel_tol=0.0):
         message = _reuse_warning_message(requested, minimum, maximum, distance_outside)
@@ -155,32 +167,138 @@ def select_leapr_temperature_block(
     LeaprFormatError
         If a negative temperature appears before any positive block.
     """
-    temperatures = available_leapr_temperatures(leapr_file)
-    if temperature is None:
-        requested = abs(float(leapr_file.temp_blocks[0]['temp']))
-    else:
-        try:
-            requested = float(temperature)
-        except (ValueError, TypeError, OverflowError) as exc:
-            raise ValueError('Requested LEAPR temperature must be finite and positive.') from exc
-        if not math.isfinite(requested) or requested <= 0.0:
-            raise ValueError('Requested LEAPR temperature must be finite and positive.')
-    source = None
-    for block in leapr_file.temp_blocks:
-        value = float(block['temp'])
-        # Negative Card 10 temperatures reuse the data from the preceding positive
-        # block.
+    cards = _validated_template_temperatures(leapr_file)
+    requested = cards[0] if temperature is None else _validate_requested_temperature(
+        temperature, "Requested LEAPR temperature must be finite and positive.",
+    )
+    source = _find_leapr_temperature_block(leapr_file, cards, requested, tolerance_k)
+    return _require_tabulated_temperature(source, requested, cards)
+
+
+def _find_leapr_temperature_block(
+    leapr_file: LeaprFile, cards: list[float], requested: float, tolerance_k: float,
+) -> tuple[dict, float] | None:
+    """Find the matching card and the positive block that supplies its spectrum.
+
+    Parameters
+    ----------
+    leapr_file : LeaprFile
+        Parsed LEAPR template.
+    cards : list of float
+        Validated signed temperatures in template order, in kelvin.
+    requested : float
+        Requested temperature in kelvin.
+    tolerance_k : float
+        Absolute matching tolerance in kelvin.
+
+    Returns
+    -------
+    tuple of (dict, float) or None
+        Source block and matching physical temperature, if present.
+    """
+    source = leapr_file.temp_blocks[0]
+    for block, value in zip(leapr_file.temp_blocks, cards):
+        # A negative Card 10 temperature reuses the last positive block.
         if value > 0.0:
             source = block
         if math.isclose(abs(value), requested, abs_tol=tolerance_k, rel_tol=0.0):
-            if source is None:
-                raise LeaprFormatError('Cannot select a negative temperature before a positive block.')
             return source, abs(value)
+    return None
+
+
+def _require_tabulated_temperature(
+    match: tuple[dict, float] | None, requested: float, cards: list[float],
+) -> tuple[dict, float]:
+    """Require a source block at the requested tabulated temperature.
+
+    Parameters
+    ----------
+    match : tuple of (dict, float) or None
+        Matching source block and temperature, if found.
+    requested : float
+        Requested temperature in kelvin.
+    cards : list of float
+        Validated signed temperatures in kelvin.
+
+    Returns
+    -------
+    tuple of (dict, float)
+        Matching source block and tabulated physical temperature.
+
+    Raises
+    ------
+    ValueError
+        If no card matches the requested temperature.
+    """
+    if match is not None:
+        return match
+
+    temperatures = tuple(sorted({abs(value) for value in cards}))
     raise ValueError(
         f'LEAPR temperature {requested:g} K is not explicitly tabulated. '
         f'Available temperatures: {temperatures}. '
         'For liquids, select an existing block; physical interpolation is not implemented.'
     )
+
+
+def _validate_requested_temperature(temperature: float, error_message: str) -> float:
+    """Convert the requested temperature and require a finite positive value.
+
+    Parameters
+    ----------
+    temperature : float
+        Requested temperature in kelvin.
+    error_message : str
+        Error text used by the calling selector.
+
+    Returns
+    -------
+    float
+        Validated temperature in kelvin.
+
+    Raises
+    ------
+    ValueError
+        If the request cannot be converted or is nonpositive or nonfinite.
+    """
+    try:
+        requested = float(temperature)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(error_message) from exc
+    if not math.isfinite(requested) or requested <= 0.0:
+        raise ValueError(error_message)
+    return requested
+
+
+def _validate_temperature_range(requested: float, minimum: float, maximum: float) -> float:
+    """Require that the request stays within the permitted template margin.
+
+    Parameters
+    ----------
+    requested : float
+        Requested temperature in kelvin.
+    minimum, maximum : float
+        Lower and upper template temperatures in kelvin.
+
+    Returns
+    -------
+    float
+        Nonnegative distance outside the template range in kelvin.
+
+    Raises
+    ------
+    ValueError
+        If the distance exceeds the five-kelvin reuse margin.
+    """
+    distance_outside = max(minimum - requested, requested - maximum, 0.0)
+    if distance_outside > TEMPERATURE_MARGIN_K:
+        raise ValueError(
+            f"Requested LEAPR temperature {requested:g} K is {distance_outside:g} K "
+            f"outside the original range [{minimum:g}, {maximum:g}] K "
+            f"(maximum permitted overshoot: {TEMPERATURE_MARGIN_K:g} K). "
+            "Edit the input LEAPR template explicitly to use this temperature."
+        )
+    return distance_outside
 
 
 def _reuse_warning_message(

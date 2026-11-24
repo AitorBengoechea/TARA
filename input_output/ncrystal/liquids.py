@@ -69,7 +69,19 @@ class LiquidAtomSettings:
             constraint, the Young--Koppel setting is incompatible with the
             species, or the S(Q) data violate the selected model's constraints.
         """
-        # Plugin entries are keyed by chemical element labels, not NCMAT site IDs.
+        self._validate_translation_settings()
+        self._validate_structure_factor()
+
+    def _validate_translation_settings(self) -> None:
+        """Validate the plugin species, translation parameters, and mode weights.
+
+        Raises
+        ------
+        ValueError
+            If the species, model, translation parameter, mode weights, or
+            Young--Koppel setting are invalid.
+        """
+        # The plugin identifies species by chemical element label.
         if not re.fullmatch(r"[A-Z][a-z]?|D", self.atom):
             raise ValueError("atom must be an element label (H, O, D, ...).")
         if self.model not in ("incoherent", "skold", "vineyard"):
@@ -87,6 +99,15 @@ class LiquidAtomSettings:
         if self.yk_model is not None:
             if self.atom not in ("H", "D") or self.yk_model not in ("ortho", "para"):
                 raise ValueError("yk_model ortho/para is only valid for H or D.")
+
+    def _validate_structure_factor(self) -> None:
+        """Validate structure-factor rows for the selected scattering model.
+
+        Raises
+        ------
+        ValueError
+            If S(Q) presence, length, ordering, or values violate model constraints.
+        """
         sq = self.static_structure_factor
         # Coherent approximations need tabulated S(Q); incoherent mode forbids it.
         if self.model == "incoherent" and sq:
@@ -124,6 +145,7 @@ def render_custom_liquids(entries: Iterable[LiquidAtomSettings]) -> str:
     entries = tuple(entries)
     if not entries or len({entry.atom for entry in entries}) != len(entries):
         raise ValueError("At least one unique atom entry is needed.")
+
     # Keep each species header adjacent to its optional spin and S(Q) rows.
     lines = ["@CUSTOM_LIQUIDS"]
     for item in entries:
@@ -156,10 +178,12 @@ def _split_ncmat(text: str) -> tuple[str, list[tuple[str, str]]]:
     # Refuse non-NCMAT input before manipulating raw section boundaries.
     if not re.match(r"^NCMAT v\d+\s*(?:\n|$)", text):
         raise ValueError("Expected an NCMAT version header.")
+
     # Record section offsets rather than parsing and rewriting unrelated data.
     boundaries = list(re.finditer(r"(?m)^@([A-Z][A-Z0-9_]*)\s*$", text))
     if not boundaries:
         raise ValueError("No NCMAT sections found.")
+
     # Retain original whitespace and section ordering for lossless round-trips.
     sections = []
     for i, match in enumerate(boundaries):
@@ -188,12 +212,66 @@ def ensure_custom_liquids(text: str) -> None:
         ``@CUSTOM_LIQUIDS`` block, or the block entries are invalid.
     """
     _, sections = _split_ncmat(text)
+
     # Exactly one populated custom block is required for liquid semantics.
     blocks = [data for name, data in sections if name == "CUSTOM_LIQUIDS"]
     if len(blocks) != 1 or not any(line.strip() and not line.lstrip().startswith('#')
                                   for line in blocks[0].splitlines()[1:]):
         raise ValueError("A single populated @CUSTOM_LIQUIDS block is required.")
     _parse_custom_liquids_block(blocks[0])
+
+
+def _parse_liquid_atom_rows(data: list[list[str]], i: int) -> tuple[LiquidAtomSettings, int]:
+    """Read one species and its optional subordinate rows.
+
+    Parameters
+    ----------
+    data : list of list of str
+        Tokenized plugin rows without comments.
+    i : int
+        Index of the species header.
+
+    Returns
+    -------
+    tuple of LiquidAtomSettings and int
+        Validated species data and index of the next header.
+
+    Raises
+    ------
+    ValueError
+        If the species header or its subordinate fields are malformed.
+    """
+    # Each atom starts with five tokens, followed by optional subordinate rows.
+    head = data[i]
+    if len(head) != 5 or head[0] == 'yk_model':
+        raise ValueError('Expected atom model c wt ws in @CUSTOM_LIQUIDS.')
+    atom, mode = head[:2]
+    try:
+        c, wt, ws = map(float, head[2:])
+    except ValueError as exc:
+        raise ValueError('Invalid liquid model parameters.') from exc
+    i += 1
+
+    # Spin-state data, when supplied, belongs to the immediately prior atom.
+    yk = None
+    if i < len(data) and data[i][0] == 'yk_model':
+        if len(data[i]) != 2:
+            raise ValueError('Expected yk_model ortho or para.')
+        yk = data[i][1]
+        i += 1
+
+    # A run of numeric pairs belongs to this atom until the next header.
+    sq = []
+    while i < len(data) and len(data[i]) == 2 and data[i][0] != 'yk_model':
+        try:
+            q, s = float(data[i][0]), float(data[i][1])
+        except ValueError:
+            break
+        sq.append((q, s))
+        i += 1
+
+    # Delegate physical and model-specific constraints to the data class.
+    return LiquidAtomSettings(atom, mode, c, wt, ws, tuple(sq), yk), i
 
 
 def _parse_custom_liquids_block(block: str) -> tuple[LiquidAtomSettings, ...]:
@@ -224,34 +302,8 @@ def _parse_custom_liquids_block(block: str) -> tuple[LiquidAtomSettings, ...]:
     entries = []
     i = 0
     while i < len(data):
-        # Each atom starts with five tokens, followed by optional subordinate rows.
-        head = data[i]
-        if len(head) != 5 or head[0] == 'yk_model':
-            raise ValueError('Expected atom model c wt ws in @CUSTOM_LIQUIDS.')
-        atom, mode = head[:2]
-        try:
-            c, wt, ws = map(float, head[2:])
-        except ValueError as exc:
-            raise ValueError('Invalid liquid model parameters.') from exc
-        i += 1
-        # Spin-state data, when supplied, belongs to the immediately prior atom.
-        yk = None
-        if i < len(data) and data[i][0] == 'yk_model':
-            if len(data[i]) != 2:
-                raise ValueError('Expected yk_model ortho or para.')
-            yk = data[i][1]
-            i += 1
-        # A run of numeric pairs belongs to this atom until the next header.
-        sq = []
-        while i < len(data) and len(data[i]) == 2 and data[i][0] != 'yk_model':
-            try:
-                q, s = float(data[i][0]), float(data[i][1])
-            except ValueError:
-                break
-            sq.append((q, s))
-            i += 1
-        # Delegate physical and model-specific constraints to the data class.
-        entries.append(LiquidAtomSettings(atom, mode, c, wt, ws, tuple(sq), yk))
+        entry, i = _parse_liquid_atom_rows(data, i)
+        entries.append(entry)
     if len(set(e.atom for e in entries)) != len(entries):
         raise ValueError('Duplicate atom entries in @CUSTOM_LIQUIDS.')
     return tuple(entries)
@@ -277,6 +329,7 @@ def parse_custom_liquids(text: str) -> tuple[LiquidAtomSettings, ...]:
         duplicated, or any plugin entry fails validation.
     """
     _, sections = _split_ncmat(text)
+
     # A duplicate block is ambiguous even if both blocks look individually valid.
     blocks = [body for name, body in sections if name == 'CUSTOM_LIQUIDS']
     if len(blocks) != 1:
@@ -311,6 +364,7 @@ def add_custom_liquids(text: str, entries: Iterable[LiquidAtomSettings]) -> str:
     trailing whitespace from the input before appending the new block.
     """
     _, sections = _split_ncmat(text)
+
     # Refuse implicit replacement: callers must explicitly edit existing models.
     if any(tag == "CUSTOM_LIQUIDS" for tag, _ in sections):
         raise ValueError("The source already has @CUSTOM_LIQUIDS; edit it explicitly.")
@@ -335,6 +389,7 @@ def replace_custom_liquids(text: str, entries: Iterable[LiquidAtomSettings]) -> 
     header, sections = _split_ncmat(text)
     if sum(tag == "CUSTOM_LIQUIDS" for tag, _ in sections) != 1:
         raise ValueError("Expected exactly one @CUSTOM_LIQUIDS block.")
+
     # Replace the custom block in place so section order and unrelated material text are
     # preserved.
     liquid = render_custom_liquids(entries)
@@ -378,6 +433,7 @@ def validate_regular_vdos_grid(energy_ev) -> float:
     grid = np.asarray(energy_ev, dtype=float)
     if grid.ndim != 1 or grid.size < 3 or not np.isfinite(grid).all():
         raise ValueError("NCrystal VDOS energy grid must contain >=3 finite values.")
+
     # NCMAT v7 stores only grid endpoints and assumes a constant interval.
     diffs = np.diff(grid)
     spacing = float((grid[-1] - grid[0]) / (grid.size - 1))
@@ -385,6 +441,7 @@ def validate_regular_vdos_grid(energy_ev) -> float:
         raise ValueError("NCrystal VDOS energy grid must be positive and increasing.")
     if not np.allclose(diffs, spacing, rtol=1e-6, atol=1e-12):
         raise ValueError("NCrystal VDOS energy grid must be uniformly spaced.")
+
     # The native VDOS regularizer requires E_min / delta_E to be integral.
     # Reject misalignment instead of shifting data and changing its physics.
     ratio = float(grid[0] / spacing)
@@ -508,6 +565,7 @@ def _render_vdos_dyninfo(body: str, grid: np.ndarray, vals: np.ndarray) -> str:
     # Retain atom metadata but substitute one regularized-grid representation.
     out = ["@DYNINFO", *_preserved_dyninfo_lines(body),
            f"  vdos_egrid {grid[0]:.15g} {grid[-1]:.15g}"]
+
     # NCMAT v7 requires the first density values on the keyword line.
     for index in range(0, len(vals), 6):
         values = " ".join(f"{value:.12g}" for value in vals[index:index + 6])
@@ -550,6 +608,7 @@ def replace_vdos(text: str, atom: str, energy_ev, density) -> str:
     # Reject malformed VDOS before changing any part of the NCMAT document.
     grid, vals = _validate_vdos_input(energy_ev, density)
     ensure_custom_liquids(text)
+
     # Keep all non-target sections exactly as supplied, including plugin data.
     header, sections = _split_ncmat(text)
     found = 0
@@ -567,10 +626,12 @@ def replace_vdos(text: str, atom: str, energy_ev, density) -> str:
         if not re.search(r"(?m)^\s*type\s+vdos\s*$", body):
             raise ValueError(f"Target atom {atom} must have @DYNINFO type vdos.")
         result.append(_render_vdos_dyninfo(body, grid, vals))
+
     # Multiple matches risk modifying the wrong representation or atom site.
     if found != 1:
         raise ValueError(f"Expected exactly one @DYNINFO VDOS for {atom}; found {found}.")
     rebuilt = header + "".join(result)
+
     # Revalidate after replacement to ensure plugin settings survived intact.
     ensure_custom_liquids(rebuilt)
     return rebuilt

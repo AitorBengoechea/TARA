@@ -31,10 +31,38 @@ class ContinuousSpectrum:
     energy_ev: np.ndarray
     density_per_ev: np.ndarray
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Validate paired samples and store read-only arrays with unit-area density."""
         energy = np.asarray(self.energy_ev, dtype=float).copy()
         density = np.asarray(self.density_per_ev, dtype=float).copy()
+        area = self._validated_area(energy, density)
+
+        # Store independent, read-only arrays at the format boundary.
+        energy.setflags(write=False)
+        density = density / area
+        density.setflags(write=False)
+        object.__setattr__(self, 'energy_ev', energy)
+        object.__setattr__(self, 'density_per_ev', density)
+
+    @staticmethod
+    def _validated_area(energy: np.ndarray, density: np.ndarray) -> float:
+        """Validate paired physical coordinates and calculate their integral.
+
+        Parameters
+        ----------
+        energy, density : numpy.ndarray
+            Candidate energy grid in eV and its density values.
+
+        Returns
+        -------
+        float
+            Positive trapezoidal integral.
+
+        Raises
+        ------
+        InputTransformationError
+            If the paired arrays or their area are invalid.
+        """
         if energy.ndim != 1 or density.ndim != 1 or len(energy) != len(density) or len(energy) < 3:
             raise InputTransformationError('Spectrum must contain at least three paired points.')
         if (not np.all(np.isfinite(energy)) or not np.all(np.isfinite(density))
@@ -44,8 +72,6 @@ class ContinuousSpectrum:
         area = float(np.trapezoid(density, energy))
         if not np.isfinite(area) or area <= 0:
             raise InputTransformationError('Spectrum must have positive integrated density.')
-        energy.setflags(write=False)
-        density = density / area
-        density.setflags(write=False)
-        object.__setattr__(self, 'energy_ev', energy)
-        object.__setattr__(self, 'density_per_ev', density)
+        return area
+
+

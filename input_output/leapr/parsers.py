@@ -123,9 +123,27 @@ def read_fixed_length_array(f: TextIO, count: int, *, card: str) -> List[float]:
 
 
 def read_phonon_spectrum_block(f: TextIO, ni: int) -> List[float]:
-    """Read exactly ``ni`` phonon density values from LEAPR Card 12.
+    """Read the declared phonon density values from LEAPR Card 12.
 
-    NJOY's Card 12 can omit a trailing slash when the stated ``ni`` values
-    have been read, as in the CAB multi-temperature H(H2O) evaluation.
+    Parameters
+    ----------
+    f : TextIO
+        Input stream positioned at Card 12.
+    ni : int
+        Number of density values declared in Card 11.
+
+    Returns
+    -------
+    list of float
+        Phonon density ordinates in input order.
+
+    Raises
+    ------
+    LeaprFormatError
+        If the card ends before its declared point count.
+
+    Notes
+    -----
+    Card 12 may omit its slash once the declared number of values is read.
     """
     return read_fixed_length_array(f, ni, card='Card 12 phonon spectrum')

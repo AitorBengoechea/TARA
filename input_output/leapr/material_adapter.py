@@ -41,15 +41,87 @@ def _oscillators(block: dict, labels: tuple[str, ...] | None) -> tuple[DiscreteO
     weights = tuple(block.get("oscillator_weights", ()))
     if len(energies) != nd or len(weights) != nd:
         raise ValueError("LEAPR oscillator arrays must both have nd entries.")
+
     # Synthesize stable mode identifiers only when the caller has not
     # supplied experiment-specific oscillator labels.
     names = tuple(f"mode_{i}" for i in range(nd)) if labels is None else tuple(labels)
     if len(names) != nd:
         raise ValueError("Oscillator label count must match LEAPR nd.")
+
     # Preserve LEAPR oscillator energies and relative weights as provided;
     # Core validators, rather than the adapter, own physical checks.
     return tuple(DiscreteOscillator(name, float(energy), float(weight)) for name, energy, weight
                  in zip(names, energies, weights))
+
+
+def _validated_translation_parameters(block) -> tuple[float, float]:
+    """Read and validate the LEAPR translation weight and width parameter.
+
+    Parameters
+    ----------
+    block : dict
+        Selected LEAPR temperature block.
+
+    Returns
+    -------
+    tuple of float
+        Translation weight and the LEAPR model parameter c.
+
+    Raises
+    ------
+    ValueError
+        If c is nonfinite, negative, or has no corresponding translation weight.
+    """
+    twt = float(block["twt"])
+    c = float(block["c"])
+    # Egelstaff--Schofield c is the LEAPR model parameter, not an SI
+    # diffusion constant; reject undefined or negative source values.
+    if not math.isfinite(c) or c < 0:
+        raise ValueError('LEAPR diffusion parameter c must be finite and nonnegative.')
+
+    # A nonzero diffusion-width parameter without translational weight
+    # would describe an inconsistent component decomposition.
+    if twt == 0 and c != 0:
+        raise ValueError('Nonzero diffusion parameter requires nonzero translation weight.')
+    return twt, c
+
+
+def _build_species_dynamics(block, twt: float, c: float) -> SpeciesDynamics:
+    """Construct Core dynamics from an already tabulated LEAPR block.
+
+    Parameters
+    ----------
+    block : dict
+        Temperature block whose spectrum includes all vibrational modes.
+    twt, c : float
+        LEAPR translation weight and effective-width parameter.
+
+    Returns
+    -------
+    SpeciesDynamics
+        Weighted continuum and independent translation contribution.
+    """
+    # Reconstruct the uniformly spaced LEAPR energy axis directly from
+    # ni and delta; do not resample the continuous spectrum here.
+    continuous = PhononSpectra(pdos=pd.Series(
+        block['phonon_spectrum'],
+        index=pd.Index(range(int(block['ni'])), dtype=float) * float(block['delta']),
+    ))
+
+    # All vibrational modes are sampled together; translation remains separate.
+    return SpeciesDynamics(
+        continuous=continuous,
+        continuous_weight=float(block["tbeta"]),
+        translation_weight=twt,
+        # Select the existing Core translation label from the LEAPR
+        # component weight and model parameter without altering either.
+        translation_model=(
+            'egelstaff_schofield' if twt > 0 and c > 0 else
+            'free_gas' if twt > 0 else 'none'
+        ),
+        translation_parameter=c if twt > 0 and c > 0 else None,
+        oscillators=(),
+    )
 
 
 def material_model_from_leapr(
@@ -95,48 +167,25 @@ def material_model_from_leapr(
     block = tabulate_vibrational_block(block)
     principal = template.principal_scatterer
     secondary = template.secondary_scatterer
-    twt = float(block["twt"])
-    c = float(block["c"])
-    # Egelstaff--Schofield c is the LEAPR model parameter, not an SI
-    # diffusion constant; reject undefined or negative source values.
-    if not math.isfinite(c) or c < 0:
-        raise ValueError('LEAPR diffusion parameter c must be finite and nonnegative.')
-    # A nonzero diffusion-width parameter without translational weight
-    # would describe an inconsistent component decomposition.
-    if twt == 0 and c != 0:
-        raise ValueError('Nonzero diffusion parameter requires nonzero translation weight.')
+    twt, c = _validated_translation_parameters(block)
+
     # The single-temperature Core model cannot encode a secondary
     # scatterer that requires its own LEAPR temperature sequence.
     if int(secondary.get("nss", 0)) > 0 and int(secondary["b7"]) != 1:
         raise NotImplementedError("Secondary LEAPR temperature loops (b7=0) are not supported.")
 
-    # Reconstruct the uniformly spaced LEAPR energy axis directly from
-    # ni and delta; do not resample the continuous spectrum here.
-    continuous = PhononSpectra(pdos=pd.Series(
-        block['phonon_spectrum'],
-        index=pd.Index(range(int(block['ni'])), dtype=float) * float(block['delta']),
-    ))
-    # All vibrational modes are sampled together; translation remains separate.
-    dynamics = SpeciesDynamics(
-        continuous=continuous,
-        continuous_weight=float(block["tbeta"]),
-        translation_weight=twt,
-        # Select the existing Core translation label from the LEAPR
-        # component weight and model parameter without altering either.
-        translation_model=(
-            'egelstaff_schofield' if twt > 0 and c > 0 else
-            'free_gas' if twt > 0 else 'none'
-        ),
-        translation_parameter=c if twt > 0 and c > 0 else None,
-        oscillators=(),
-    )
+    dynamics = _build_species_dynamics(block, twt, c)
+
     # Secondary-scatterer metadata are optional; preserve the original
     # principal-only representation when LEAPR declares none.
     others = ()
     if int(secondary.get("nss", 0)) > 0:
-        others = (ScatteringSpecies(
-            secondary_label, int(secondary["mss"]), float(secondary["aws"])
-        ),)
+        others = (
+            ScatteringSpecies(
+                secondary_label, int(secondary["mss"]), float(secondary["aws"])
+            ),
+        )
+
     # Preserve LEAPR material identity, selected temperature, species
     # multiplicities and mass ratios in the backend-independent model.
     return MaterialScatteringModel(

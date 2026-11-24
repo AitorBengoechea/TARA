@@ -11,7 +11,18 @@ _DENS = re.compile(r'(?m)^(?P<leading>\s*vdos_density\s+)[\s\S]*?(?=^\s*(?:vdos_
 
 
 def _blocks(text):
-    """Yield each DYNINFO block with its half-open character span in the source."""
+    """Yield DYNINFO sections and their character spans.
+
+    Parameters
+    ----------
+    text : str
+        Original NCMAT source.
+
+    Yields
+    ------
+    tuple of int, int, and str
+        Half-open character span and original text of one DYNINFO block.
+    """
     marker = re.compile(r'(?m)^@DYNINFO\b')
     for match in marker.finditer(text):
         end = re.search(r'(?m)^@\w+', text[match.end():])
@@ -20,7 +31,25 @@ def _blocks(text):
 
 
 def _block(text, symbol):
-    """Return the unique VDOS DYNINFO block and source span for a species."""
+    """Locate the unique VDOS DYNINFO section for a species.
+
+    Parameters
+    ----------
+    text : str
+        Original NCMAT source.
+    symbol : str
+        Requested species label.
+
+    Returns
+    -------
+    tuple of int, int, and str
+        Half-open character span and original DYNINFO text.
+
+    Raises
+    ------
+    InputTransformationError
+        If the species is absent, ambiguous, or has dynamics other than VDOS.
+    """
     candidates = []
     for start, end, block in _blocks(text):
         element = re.search(r'(?m)^\s*element\s+(\S+)', block)
@@ -178,10 +207,12 @@ class NCrystalAdapter:
         if not grid or not dens:
             raise InputTransformationError(f'Target NCMAT {element} VDOS fields missing.')
         new_grid = f'{grid.group("leading")}{e[0]:.16g} {e[-1]:.16g}'
+
         # NCMAT permits free-form values and repeated zeros. We write plain
         # numeric values to avoid ambiguous repetition syntax.
         lines = [' '.join(f'{v:.15g}' for v in g[i:i+6]) for i in range(0, len(g), 6)]
         new_dens = dens.group('leading') + lines[0] + ''.join('\n    ' + line for line in lines[1:]) + '\n'
+
         # Replace from right to left so offsets cannot shift.
         edits = sorted([(grid.start(), grid.end(), new_grid), (dens.start(), dens.end(), new_dens)], reverse=True)
         for a, b, value in edits:

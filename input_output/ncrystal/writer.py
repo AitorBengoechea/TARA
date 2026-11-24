@@ -43,45 +43,67 @@ class NCrystalWriter:
             # NCMAT's version is a required leading header, not an @-block.
             f.write(f"NCMAT v{self.nc.version}\n")
             
-            if self.nc.state_of_substance:
-                self._write_block(f, "STATEOFMATTER", [self.nc.state_of_substance])
-                
-            if self.nc.density:
-                self._write_block(f, "DENSITY", [self.nc.density])
-                
-            if self.nc.cell:
-                if 'raw_lines' in self.nc.cell:
-                    self._write_block(f, "CELL", self.nc.cell['raw_lines'])
-                elif 'lengths' in self.nc.cell and 'angles' in self.nc.cell:
-                    l = self.nc.cell['lengths']
-                    a = self.nc.cell['angles']
-                    self._write_block(f, "CELL", [f"{l[0]} {l[1]} {l[2]} {a[0]} {a[1]} {a[2]}"])
-                else:
-                    self._write_block(f, "CELL", [str(self.nc.cell.get('a', ''))])
-                    
-            if self.nc.spacegroup > 0:
-                self._write_block(f, "SPACEGROUP", [str(self.nc.spacegroup)])
-                
-            if self.nc.atom_positions:
-                pos_lines = [f"{p['element']} {p['x']} {p['y']} {p['z']}" 
-                             for p in self.nc.atom_positions]
-                self._write_block(f, "ATOMPOSITIONS", pos_lines)
-                
+            self._write_material_blocks(f)
+
             for dyn_block in self.nc.dyninfo:
                 self._write_dyninfo(f, dyn_block)
                 
-            if self.nc.custom_vdosebins is not None:
-                self._write_array_block(f, "CUSTOM_VDOSEBINS", self.nc.custom_vdosebins)
-                
-            if self.nc.custom_vdos is not None:
-                self._write_array_block(f, "CUSTOM_VDOS", self.nc.custom_vdos)
-                
-            for tag, lines in self.nc.raw_blocks.items():
-                if isinstance(lines[0], str):
-                    self._write_block(f, tag, lines)
-                else:
-                    for sub_lines in lines:
-                        self._write_block(f, tag, sub_lines)
+            self._write_extension_blocks(f)
+
+    def _write_material_blocks(self, f: TextIO) -> None:
+        """Write material state, density, cell, and atom positions.
+
+        Parameters
+        ----------
+        f : TextIO
+            Open NCMAT output stream.
+        """
+        if self.nc.state_of_substance:
+            self._write_block(f, "STATEOFMATTER", [self.nc.state_of_substance])
+
+        if self.nc.density:
+            self._write_block(f, "DENSITY", [self.nc.density])
+
+        if self.nc.cell:
+            if 'raw_lines' in self.nc.cell:
+                self._write_block(f, "CELL", self.nc.cell['raw_lines'])
+            elif 'lengths' in self.nc.cell and 'angles' in self.nc.cell:
+                l = self.nc.cell['lengths']
+                a = self.nc.cell['angles']
+                self._write_block(f, "CELL", [f"{l[0]} {l[1]} {l[2]} {a[0]} {a[1]} {a[2]}"])
+            else:
+                self._write_block(f, "CELL", [str(self.nc.cell.get('a', ''))])
+
+        if self.nc.spacegroup > 0:
+            self._write_block(f, "SPACEGROUP", [str(self.nc.spacegroup)])
+
+        if self.nc.atom_positions:
+            pos_lines = [f"{p['element']} {p['x']} {p['y']} {p['z']}"
+                         for p in self.nc.atom_positions]
+            self._write_block(f, "ATOMPOSITIONS", pos_lines)
+
+
+    def _write_extension_blocks(self, f: TextIO) -> None:
+        """Write custom vibrational arrays and retained extension blocks.
+
+        Parameters
+        ----------
+        f : TextIO
+            Open NCMAT output stream.
+        """
+        if self.nc.custom_vdosebins is not None:
+            self._write_array_block(f, "CUSTOM_VDOSEBINS", self.nc.custom_vdosebins)
+
+        if self.nc.custom_vdos is not None:
+            self._write_array_block(f, "CUSTOM_VDOS", self.nc.custom_vdos)
+
+        for tag, lines in self.nc.raw_blocks.items():
+            if isinstance(lines[0], str):
+                self._write_block(f, tag, lines)
+            else:
+                for sub_lines in lines:
+                    self._write_block(f, tag, sub_lines)
+
 
     def _write_block(self, f: TextIO, tag: str, lines: List[str]) -> None:
         """Writes a standard text block with an @ tag.
