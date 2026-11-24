@@ -21,6 +21,17 @@ SAMPLING_METHODS = frozenset({'latin_hypercube', 'monte_carlo'})
 class ParameterSpaceSampler:
     """Produce signed uniform multipliers for named parameter groups.
 
+    Parameters
+    ----------
+    sampling_method : str, optional
+        Perturbation design. Use "latin_hypercube" or "monte_carlo". Default
+        is "latin_hypercube".
+    seed : int, optional
+        Seed in [0, 2**32) used to derive the named Latin-hypercube streams.
+        Default is 0.
+
+    Notes
+    -----
     ``monte_carlo`` with no supplied ``rng`` uses NumPy's legacy global
     generator to preserve VDOS sequences. Supply a local Generator for the
     original diffusion Monte Carlo behavior. ``latin_hypercube`` uses

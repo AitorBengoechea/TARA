@@ -12,6 +12,40 @@ import numpy as np
 class NCrystalEngine:
     """Hold loaded NCrystal state for zero-file-I/O Analyzer parsing.
 
+    Parameters
+    ----------
+    filepath : str
+        Path identifying the transient NCMAT resource.
+    temperature : float
+        Evaluation temperature in kelvin.
+    target_lbl : str
+        Label of the evaluated scattering species.
+    mat : Any
+        Loaded NCrystal material object.
+    nuc_data : Any
+        NCrystal atom data for the target species.
+    mass_amu : float
+        Target mass in atomic mass units.
+    energy_grid : np.ndarray
+        Energy coordinates of the source vibrational spectrum in eV.
+    pdos : np.ndarray
+        Source vibrational density evaluated at the energy coordinates.
+    backend_energy_grid : np.ndarray or None, optional
+        Energy coordinates of the VDOS passed to NCrystal in eV. Default is
+        None.
+    backend_pdos : np.ndarray or None, optional
+        VDOS density evaluated on the NCrystal input grid. Default is None.
+    scatter_inelastic : Any or None, optional
+        Native inelastic scattering handle. Default is None.
+    scatter_coherent_elastic : Any or None, optional
+        Native coherent elastic scattering handle. Default is None.
+    scatter_incoherent_elastic : Any or None, optional
+        Native incoherent elastic scattering handle. Default is None.
+    liquid_data : Any or None, optional
+        Native liquid analysis state, when available. Default is None.
+
+    Notes
+    -----
     ``filepath`` identifies the transient NCMAT resource owned by Processing.
     ``energy_grid`` and ``pdos`` retain the full Core arrays for thermodynamics.
     ``backend_energy_grid`` and ``backend_pdos`` mirror the atom-specific VDOS

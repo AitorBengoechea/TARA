@@ -9,6 +9,31 @@ import numpy as np
 class LiquidKernel:
     """Completed per-atom kernel; alpha uses neutron mass and beta is signed.
 
+    Parameters
+    ----------
+    label : str
+        NCrystal label of the scattering species.
+    alpha : np.ndarray
+        Dimensionless momentum-transfer coordinates scaled with the neutron
+        mass.
+    beta : np.ndarray
+        Signed dimensionless energy-transfer coordinates.
+    sab : np.ndarray
+        Unsymmetrized dimensionless scattering-law values indexed by beta,
+        then alpha.
+    mass_amu : float
+        Target mass in atomic mass units.
+    temperature : float
+        Evaluation temperature in kelvin.
+    bound_xs : float
+        Bound scattering cross section in barns.
+    fraction : float
+        Atomic fraction of the scattering species.
+    suggested_emax : float
+        Suggested upper incident-energy limit in eV.
+
+    Notes
+    -----
     Values are unsymmetrized dimensionless S, indexed [beta, alpha].
     ``fraction`` is the original atomic fraction, never applied to S.
     """
@@ -45,7 +70,36 @@ class LiquidKernel:
 
 @dataclass
 class LiquidAnalysisState:
-    """Loaded child results; no live C++ objects or temporary files escape."""
+    """Loaded child results; no live C++ objects or temporary files escape.
+
+    Parameters
+    ----------
+    target_lbl : str
+        Label of the evaluated scattering species.
+    kernels : dict[str, LiquidKernel]
+        Completed liquid scattering kernels keyed by species label.
+    energy_grid : np.ndarray
+        Energy coordinates of the source vibrational spectrum in eV.
+    pdos : np.ndarray
+        Source vibrational density evaluated at the energy coordinates.
+    backend_energy_grid : np.ndarray
+        Energy coordinates of the VDOS passed to NCrystal in eV.
+    backend_pdos : np.ndarray
+        VDOS density evaluated on the NCrystal input grid.
+    xs_energy : np.ndarray
+        Incident-energy grid for cross-section values in eV.
+    xs_scattering : np.ndarray
+        Native scattering cross sections in barns per atom.
+    xs_absorption : np.ndarray
+        Native absorption cross sections in barns per atom.
+    vdos_analysis : dict[str, float]
+        Thermodynamic quantities evaluated from the native VDOS.
+    provenance : dict[str, Any]
+        Metadata describing the source and settings of the capture.
+    target_mass_amu : float or None, optional
+        Explicit target mass in atomic mass units. Defaults to the kernel
+        mass when read. Default is None.
+    """
     target_lbl: str
     kernels: dict[str, LiquidKernel]
     energy_grid: np.ndarray

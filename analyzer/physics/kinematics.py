@@ -295,7 +295,24 @@ def decode_njoy_mf7_sab(
 
 @dataclass
 class DsfResult:
-    """Data calculated for one incident neutron energy."""
+    """Data calculated for one incident neutron energy.
+
+    Parameters
+    ----------
+    Ein : float
+        Incident neutron energy in eV.
+    data : pd.DataFrame or None, optional
+        Tabulated dynamic structure factor. Default is None.
+    kernel : pd.Series or None, optional
+        Scattering kernel for the selected incident energy. Default is None.
+    angular_distribution : pd.Series or None, optional
+        Angular distribution for the selected incident energy. Default is
+        None.
+    energy_distribution : pd.Series or None, optional
+        Outgoing energy distribution. Default is None.
+    ratios : pd.Series or None, optional
+        Integrated scattering ratios. Default is None.
+    """
 
     Ein: float
     data: Optional[pd.DataFrame] = None

@@ -250,7 +250,15 @@ class UnsupportedLiquidAceExport(NotImplementedError):
 
 @dataclass
 class NCrystalNativeState:
-    """Native NCrystal scattering state, with no ENDF intermediate."""
+    """Native NCrystal scattering state, with no ENDF intermediate.
+
+    Parameters
+    ----------
+    cfgstr : str
+        Configuration string used to load the native scattering object.
+    scatter : Any
+        Loaded native NCrystal scattering object.
+    """
 
     cfgstr: str
     scatter: Any

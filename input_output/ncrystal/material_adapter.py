@@ -14,6 +14,24 @@ import numpy as np
 class VDOSRepresentationDiagnostics:
     """Difference from TARA's previous, NCrystal-incompatible VDOS grid.
 
+    Parameters
+    ----------
+    original_min_ev : float
+        First energy of the baseline grid in eV.
+    original_step_ev : float
+        Step size used by the baseline representation in eV.
+    regular_min_ev : float
+        First energy of the regularized grid in eV.
+    regular_step_ev : float
+        Regular grid spacing in eV.
+    shape_l1_change : float
+        Integral of the absolute difference between the normalized VDOS
+        shapes.
+    displacement_moment_relative_change : float
+        Relative change in the VDOS displacement-moment diagnostic.
+
+    Notes
+    -----
     The baseline below is a *hypothetical* nonregular representation, not a
     NCrystal-valid scattering model. A large displacement-moment difference
     flags sensitivity and requires independent physical validation.

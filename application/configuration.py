@@ -89,6 +89,15 @@ _REQUIRED = {
 class AceApplicationConfig:
     """Validated application input for one ACE generation run.
 
+    Parameters
+    ----------
+    file_path : Path
+        Path to the input TOML file.
+    sections : dict[str, dict[str, Any]]
+        Validated configuration tables keyed by section name.
+
+    Notes
+    -----
     Attributes
     ----------
     file_path : pathlib.Path

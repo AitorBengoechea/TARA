@@ -16,53 +16,51 @@ class TaraConfigError(Exception):
 
 @dataclass
 class VibrationSamplingConfig:
-    """
-    Bounds and sampling strategies for vibrational spectra.
-
-    This class enforces mandatory perturbation limits and algorithmic defaults,
-    ensuring all parameters are physically valid before initializing the mathematical
-    samplers.
+    """Configure perturbations of a vibrational spectrum.
 
     Parameters
     ----------
     max_energy_shift_mev : float
-        The maximum allowed energy shift for a peak in absolute meV.
+        Maximum absolute peak-energy shift in meV.
     max_amplitude_shift_pct : float
-        The maximum allowed amplitude variation as a relative percentage.
+        Maximum relative amplitude change in percent.
     n_samples : int, optional
-        The total requested sample ensemble size.
-        Default is 0.
-    grid_partition_method : str, optional
-        The strategy for partitioning the spectrum ('automatic' or 'manual').
-        Default is 'automatic'.
-    manual_energy_ranges : list of tuple of float, optional
-        Explicit energy intervals [(E_start, E_end), ...] required if 
-        grid_partition_method is 'manual'. Default is None.
-    automatic_partition_prominence_pct : float, optional
-        Minimum prominence of a PDOS valley, expressed as a percentage of
-        the maximum density, for automatic domain detection. Smaller positive
-        values retain more valleys. Ignored for manual partitioning.
-        Default is 1.0, preserving the historical automatic behavior.
-    domain_splitting_strategy : str, optional
-        The rule for boundary variation across the ensemble ('fixed', 'deterministic', 
-        or 'random'). Default is 'fixed'.
-    correlation_strategy : str, optional
-        The rule for structural interactions ('independent' or 'random_group'). 
-        Default is 'independent'.
-    variable_coupling : str, optional
-        The rule for coupling spatial and amplitude variables within a domain 
-        ('independent' or 'coupled'). Default is 'independent'.
+        Number of stochastic samples. The default of 0 allows a deterministic
+        preview.
+    grid_partition_method : {"automatic", "manual"}, optional
+        Method used to define vibrational energy domains. Default is
+        "automatic".
+    manual_energy_ranges : list of tuple of float or None, optional
+        Domain boundaries in eV. Required for manual partitioning. Default
+        is None.
+    domain_splitting_strategy : {"fixed", "deterministic", "random"}, optional
+        Strategy for varying domain boundaries across samples. Default is
+        "fixed".
+    correlation_strategy : {"independent", "random_group"}, optional
+        Strategy for sharing perturbation multipliers across domains. Default
+        is "independent".
+    variable_coupling : {"independent", "coupled"}, optional
+        Coupling between energy and amplitude multipliers. Default is
+        "independent".
     shared_grid_structure : bool, optional
-        If True, amplitude and spatial operators use the exact same x-range structure. 
-        Default is True.
+        Shared-grid setting recorded in the ensemble metadata. Default is True.
     freeze_origin : bool, optional
-        If True, explicitly freezes the absolute zero-energy boundary point across all 
-        samples to preserve the Debye approximation. Default is True.
+        Keep the zero-energy origin fixed during energy shifts. Default is True.
+    fast_amplitude : bool, optional
+        Legacy amplitude setting. The sampler selects the amplitude operator
+        through its `amplitude_method` argument. Default is True.
+    automatic_partition_prominence_pct : float, optional
+        Minimum valley prominence as a percentage of the maximum density
+        for automatic partitioning. Default is 1.0.
     sampling_method : {"latin_hypercube", "monte_carlo"}, optional
-        Stochastic parameter-space design. Default is Latin hypercube, with
-        a separate design per topology-defined sub-ensemble.
+        Design used to draw perturbation multipliers. Default is
+        "latin_hypercube", with a separate design for each topology block.
     random_seed : int, optional
-        Reproducible Latin-hypercube seed. Default is 0 for direct Core callers.
+        Design seed in the interval [0, 2**32). Default is 0.
+
+    Attributes
+    ----------
+    vibration_enabled
     """
     # 1. Mandatory User Parameters
     max_energy_shift_mev: float
@@ -195,26 +193,28 @@ class VibrationSamplingConfig:
 
 @dataclass(frozen=True)
 class DiffusionSamplingConfig:
-    """Optional bounded sensitivity sampling for Egelstaff--Schofield liquids.
+    """Configure translation sampling for an Egelstaff–Schofield liquid.
 
     Parameters
     ----------
     enabled : bool, optional
-        False preserves the existing translational contribution exactly.
-    mode : str, optional
-        ``diffusivity_only``, ``weight_fixed_d`` or ``joint_independent``.
+        Enable translation sampling. Default is False.
+    mode : {"diffusivity_only", "weight_fixed_d", "joint_independent"}, optional
+        Vary diffusivity, vary translation weight at fixed diffusivity, or
+        vary both independently, respectively. Default is "diffusivity_only".
     max_diffusivity_shift_pct : float, optional
-        Maximum relative change of physical self-diffusivity in percent.
+        Maximum relative diffusivity change in percent. Must be in [0, 100).
+        Default is 0.0.
     max_weight_shift_pct : float, optional
-        Maximum relative change in translational weight in percent.
-    weight_compensation : str or None, optional
-        Mandatory ``continuous_only`` policy for changing translational weight.
-        Oscillator contributions remain fixed; no silent normalization occurs.
+        Maximum relative translation weight change in percent. Must be in
+        [0, 100). Default is 0.0.
+    weight_compensation : {"continuous_only"} or None, optional
+        Use "continuous_only" when varying translation weight. The compensation
+        is applied to the continuous vibrational weight. Default is None.
 
     Notes
     -----
-    Bounds are sensitivity ranges, not calibrated uncertainty intervals.
-    Model switching from free gas is deliberately unsupported.
+    The bounds specify the ranges explored in a sensitivity study.
     """
 
     enabled: bool = False
@@ -262,21 +262,62 @@ class TaraConfig(VibrationSamplingConfig):
 
     Parameters
     ----------
-    max_energy_shift_mev, max_amplitude_shift_pct : float, optional
-        Vibrational perturbation bounds. Both default to zero, which is
-        valid for translation-only sampling.
+    max_energy_shift_mev : float, optional
+        Maximum absolute peak-energy shift in meV. Default is 0.0.
+    max_amplitude_shift_pct : float, optional
+        Maximum relative amplitude change in percent. Default is 0.0.
     n_samples : int, optional
-        Stochastic sample count for all active perturbations. Zero is only
-        supported for a deterministic vibrational preview.
-    diffusion : mapping or DiffusionSamplingConfig, optional
-        Translation settings. Pass a mapping with ``enabled=True`` and the
-        appropriate mode, bounds, and weight-compensation policy to activate
-        diffusion sampling. Omitting this option keeps the vibration-only API.
+        Number of stochastic samples, excluding the reference. The default
+        of 0 allows a deterministic vibrational preview. Diffusion sampling
+        requires a positive count.
+    grid_partition_method : {"automatic", "manual"}, optional
+        Method used to define vibrational energy domains. Default is
+        "automatic".
+    manual_energy_ranges : list of tuple of float or None, optional
+        Domain boundaries in eV. Required for manual partitioning. Default
+        is None.
+    domain_splitting_strategy : {"fixed", "deterministic", "random"}, optional
+        Strategy for varying domain boundaries across samples. Default is
+        "fixed".
+    correlation_strategy : {"independent", "random_group"}, optional
+        Strategy for sharing perturbation multipliers across domains. Default
+        is "independent".
+    variable_coupling : {"independent", "coupled"}, optional
+        Coupling between energy and amplitude multipliers. Default is
+        "independent".
+    shared_grid_structure : bool, optional
+        Shared-grid setting recorded in the ensemble metadata. Default is True.
+    freeze_origin : bool, optional
+        Keep the zero-energy origin fixed during energy shifts. Default is True.
+    fast_amplitude : bool, optional
+        Legacy amplitude setting. The sampler selects the amplitude operator
+        through its `amplitude_method` argument. Default is True.
+    automatic_partition_prominence_pct : float, optional
+        Minimum valley prominence as a percentage of the maximum density
+        for automatic partitioning. Default is 1.0.
+    sampling_method : {"latin_hypercube", "monte_carlo"}, optional
+        Design used to draw perturbation multipliers. Default is
+        "latin_hypercube", with a separate design for each topology block.
+    random_seed : int, optional
+        Design seed in the interval [0, 2**32). Default is 0.
+    diffusion : DiffusionSamplingConfig or mapping or None, optional
+        Keyword-only translation settings. A mapping is converted to a
+        `DiffusionSamplingConfig`. Default is None.
+
+    Attributes
+    ----------
+    vibration_enabled
+    diffusion_enabled
 
     See Also
     --------
-    VibrationSamplingConfig : Other vibrational settings and shared design options.
-    DiffusionSamplingConfig : Modes, bounds, and weight-compensation policies.
+    DiffusionSamplingConfig : Translation modes and their required bounds.
+
+    Notes
+    -----
+    For translation-only sampling, enable diffusion and leave both vibrational
+    bounds at zero. For joint sampling, enable diffusion and set at least one
+    vibrational bound above zero.
     """
 
     max_energy_shift_mev: float = 0.0

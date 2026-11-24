@@ -25,7 +25,15 @@ from processing.deck_builders.leapr_builder import build_analysis_deck
 
 @dataclass(frozen=True)
 class NjoyExecution:
-    """Transient state produced by one isolated NJOY execution."""
+    """Transient state produced by one isolated NJOY execution.
+
+    Parameters
+    ----------
+    run_dir : Path
+        Working directory containing this execution's tapes.
+    stdout_text : str
+        Captured NJOY standard output.
+    """
 
     run_dir: Path
     stdout_text: str
