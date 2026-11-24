@@ -1,0 +1,51 @@
+# TARA V2 — educational H(H2O) at 296 K, independently sampled continuous VDOS.
+# Replace input paths with matching, physically validated NJOY2016 evaluations.
+# mti=222 is the conventional NJOY2016 educational H(H2O) assignment.
+# Different data evaluations can use a different MT; verify rather than guessing.
+
+[workflow]
+backend = "njoy"
+
+[material]
+base_endf_file = "/replace/with/neutron_H1.endf"
+leapr_file = "/replace/with/H_H2O_296K.leapr"
+temperature_k = 296.0
+state = "liquid"
+
+[output]
+directory = "../../tara_output/ace_njoy_water_v2"
+
+[ensemble]
+n_samples = 3
+include_reference = true
+random_seed = 20261008
+batch_size = 512
+
+[execution]
+n_jobs = 1
+njoy_executable = "njoy"
+
+[sampling]
+max_energy_shift_mev = 1.0
+max_amplitude_shift_pct = 3.0
+grid_partition_method = "automatic"
+automatic_partition_prominence_pct = 1.0
+manual_energy_ranges = []
+domain_splitting_strategy = "fixed"
+correlation_strategy = "independent"
+variable_coupling = "independent"
+shared_grid_structure = true
+freeze_origin = true
+fast_amplitude = true
+amplitude_method = "fast"
+spatial_method = "diffeomorphic"
+auto_normalize = true
+
+[ace]
+max_energy_ev = 5.0
+suffix = ".01"
+nbin = 16
+tolerance = 0.001
+save_xsdir = true
+mti = 222  # Verified for this educational H(H2O) reference, not arbitrary TSLs.
+mte = 0    # No separate elastic thermal reaction for this model.
