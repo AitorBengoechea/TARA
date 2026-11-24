@@ -25,3 +25,7 @@ __pycache__/
 # Operating-system metadata
 .DS_Store
 Thumbs.db
+
+# Miscellaneous
+test_output.txt
+*:Zone.Identifier
