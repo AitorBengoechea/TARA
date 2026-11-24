@@ -200,10 +200,26 @@ class UniversalAcePipeline:
         if not tsl_paths:
             raise ValueError(f"No .endf files found in {source}.")
 
+        sab_tapes = UniversalAcePipeline._index_tsl_paths(tsl_paths)
+        return sab_tapes, input_dir
+
+    @staticmethod
+    def _index_tsl_paths(tsl_paths):
+        """Index ENDF paths by normalized sample identifier.
+
+        Parameters
+        ----------
+        tsl_paths : sequence of pathlib.Path
+            Existing ENDF paths in processing order.
+
+        Returns
+        -------
+        dict of str to str
+            Unique sample IDs and corresponding ENDF path strings.
+        """
         sab_tapes: Dict[str, str] = {}
         for path in tsl_paths:
             sample_id = path.stem
-            # Normalize the TSL suffix before checking identifiers for collisions.
             if sample_id.endswith("_sab"):
                 sample_id = sample_id[:-4]
             if not sample_id:
@@ -213,7 +229,7 @@ class UniversalAcePipeline:
                     f"Duplicate sample ID {sample_id!r} from TSL ENDF filenames."
                 )
             sab_tapes[sample_id] = str(path)
-        return sab_tapes, input_dir
+        return sab_tapes
 
     @staticmethod
     def _validate_complete_batch(

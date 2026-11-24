@@ -1,5 +1,4 @@
 """Fresh-process native extraction; invoked only by the Processing backend."""
-
 from __future__ import annotations
 
 import hashlib
@@ -8,7 +7,6 @@ import os
 from pathlib import Path
 import re
 import sys
-from typing import Any, Dict, Set, Tuple
 
 import NCrystal as NC
 import numpy as np
@@ -17,433 +15,396 @@ from input_output.ncrystal.liquids import parse_custom_liquids
 from processing.backends.ncmat_isolation import isolate_ncmat_dyninfo
 
 
-def _verify_child_library_environment(expected_library_path: str) -> None:
-    """Verify NCrystal 4.4.6 ABI and ensure no mixed shared libraries loaded.
+def capture(request_path):
+    """Capture kernels and native cross sections for one isolated material.
 
     Parameters
     ----------
-    expected_library_path : str
-        Expected path to ``libNCrystal.so`` from the adapter manifest.
+    request_path : path-like
+        JSON request in the sample sandbox.
+    """
+    root, request, text, settings, cfg = _read_capture_inputs(request_path)
+    _verify_native_library(request['library_path'])
+    # Native dynamics hold weak references to Info, so keep it for the capture.
+    info = NC.createInfo(cfg)
+    dynamics, active = _active_dynamics(info, settings, request)
+    energies = np.loadtxt(root / "energies.txt", ndmin=1)
+    mat, arrays, components, sum_xs, selected_xs = _capture_liquid_components(
+        root, cfg, settings, dynamics, request['temperature'], energies, active,
+    )
+    _include_free_gas(
+        root, text, dynamics.keys() - settings.keys(), request['temperature'],
+        energies, active, sum_xs, selected_xs,
+    )
+    _finalize_cross_sections(mat, arrays, sum_xs, selected_xs)
+    target = dynamics[request['target']]
+    arrays['backend_energy_grid'] = target.vdos_egrid_expanded
+    arrays['backend_pdos'] = target.vdos_density
+    _write_capture_result(root, arrays, components, target, text, active, request)
+
+
+def _read_capture_inputs(request_path):
+    """Read the capture request and its source material.
+
+    Parameters
+    ----------
+    request_path : path-like
+        JSON request in the sample sandbox.
+
+    Returns
+    -------
+    tuple
+        Sandbox path, request, source NCMAT text, liquid settings by label,
+        and native configuration string.
 
     Raises
     ------
     RuntimeError
-        If the NCrystal version or mapped shared libraries do not match.
+        If the installed NCrystal version is incompatible with capture.
     """
+    request_path = Path(request_path)
+    root = request_path.parent
+    request = json.loads(request_path.read_text())
     if NC.__version__ != "4.4.6":
         raise RuntimeError("Unverified NCrystal ABI; expected 4.4.6")
+    material = root / "material.ncmat"
+    text = material.read_text()
+    settings = {item.atom: item for item in parse_custom_liquids(text)}
+    cfg = f"{material};temp={request['temperature']:.17g}K;vdoslux={request['vdoslux']}"
+    return root, request, text, settings, cfg
 
+
+def _capture_liquid_components(root, cfg, settings, dynamics, temperature, energies, active):
+    """Load the liquid model and read the components written by the capture hook.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Sample sandbox containing the captured files.
+    cfg : str
+        NCrystal configuration for the full material.
+    settings, dynamics : dict
+        Custom liquid settings and native dynamics keyed by species label.
+    temperature : float
+        Requested temperature in kelvin.
+    energies : numpy.ndarray
+        Incident energies in eV.
+    active : set of str
+        Species included in the selected scattering cross section.
+
+    Returns
+    -------
+    tuple
+        Loaded material, output arrays, component metadata, and the full
+        and selected liquid scattering totals in barns.
+
+    Raises
+    ------
+    RuntimeError
+        If the native model or number of captured kernels is unexpected.
+    """
+    mat = NC.load(cfg)
+    if "LiquidsModel" not in mat.scatter.getName():
+        raise RuntimeError("LiquidsModel was not selected")
+    # Disable the dump hook before evaluating any isolated free-gas species.
+    os.environ.pop("NCRYSTAL_SAB_DUMP_DIR", None)
+
+    files = sorted(root.glob("sab_*.json"))
+    if len(files) != len(settings):
+        raise RuntimeError(f"Expected {len(settings)} kernels, captured {len(files)}")
+    arrays = {"xs_energy": energies, "xs_absorption": mat.absorption.xsect(energies)}
+    components, sum_xs, selected_xs = _read_captured_kernels(
+        files, arrays, settings, dynamics, temperature, energies, active,
+    )
+    return mat, arrays, components, sum_xs, selected_xs
+
+
+def _finalize_cross_sections(mat, arrays, sum_xs, selected_xs):
+    """Validate the component sum and store the selected scattering values.
+
+    Parameters
+    ----------
+    mat : object
+        Loaded NCrystal material exposing its native scattering calculation.
+    arrays : dict
+        Output arrays with incident energies and absorption cross sections.
+    sum_xs, selected_xs : numpy.ndarray
+        Full and selected scattering totals in barns per original material atom.
+
+    Raises
+    ------
+    RuntimeError
+        If the component sum differs from native material scattering.
+    ValueError
+        If a reported scattering or absorption value is negative or nonfinite.
+    """
+    native_xs = mat.scatter.xsect(arrays['xs_energy'])
+    if not np.allclose(sum_xs, native_xs, rtol=1e-9, atol=1e-10):
+        raise RuntimeError("Captured components do not reconstruct native material scattering")
+    arrays['xs_scattering'] = selected_xs
+    for key in ('xs_scattering', 'xs_absorption'):
+        if not np.isfinite(arrays[key]).all() or np.any(arrays[key] < 0):
+            raise ValueError(f"Invalid {key}")
+
+
+def _verify_native_library(expected_path):
+    """Check the shared library loaded in the child process.
+
+    Parameters
+    ----------
+    expected_path : str
+        Expected absolute NCrystal shared library path.
+    """
+    # Detect loader overrides that would mix two C++ library installations.
     from NCrystal._locatelib import get_libpath_and_namespace
-
     loaded_path, namespace = get_libpath_and_namespace()
-    expected = Path(expected_library_path).resolve()
-    if namespace or Path(loaded_path).resolve() != expected:
-        raise RuntimeError("Child loaded a different NCrystal library")
-
-    mapped = {
-        Path(line.split(maxsplit=5)[-1].strip()).resolve()
-        for line in Path("/proc/self/maps").read_text(encoding="utf-8").splitlines()
-        if "/" in line and "libNCrystal" in line
-    }
-    if mapped != {expected}:
-        raise RuntimeError("Mixed or unexpected NCrystal shared libraries in child")
+    if namespace or Path(loaded_path).resolve() != Path(expected_path).resolve():
+        raise RuntimeError('Child loaded a different NCrystal library')
+    mapped = {Path(line.split(maxsplit=5)[-1].strip()).resolve()
+              for line in Path('/proc/self/maps').read_text().splitlines()
+              if '/' in line and 'libNCrystal' in line}
+    if mapped != {Path(expected_path).resolve()}:
+        raise RuntimeError('Mixed or unexpected NCrystal shared libraries in child')
 
 
-def _validate_liquid_dyninfos(
-    info: Any,
-    settings: Dict[str, Any],
-    request: Dict[str, Any],
-) -> Tuple[Dict[str, Any], Set[str]]:
-    """Validate NCMAT dynamic blocks against ``@CUSTOM_LIQUIDS`` and target settings.
+def _active_dynamics(info, settings, request):
+    """Validate the requested species against the native dynamics.
 
     Parameters
     ----------
     info : NCrystal.Info
-        Loaded NCrystal material info object.
-    settings : dict of str to LiquidAtomSettings
-        Parsed ``@CUSTOM_LIQUIDS`` entries keyed by atom label.
-    request : dict of str to Any
-        Child capture request parameters.
+        Loaded material owning the native dynamics.
+    settings : dict
+        Parsed custom liquid settings by species.
+    request : dict
+        Capture configuration containing the active species and target.
 
     Returns
     -------
-    dynamics : dict of str to Any
-        NCrystal ``DynInfo`` objects keyed by display label.
-    active : set of str
-        Validated set of active scattering species labels.
-
-    Raises
-    ------
-    ValueError
-        If labels are duplicated, missing, have unsupported dynamic types,
-        or the requested target lacks a captured liquid VDOS kernel.
+    tuple of dict and set
+        Dynamics by label and the selected species labels.
     """
     dynamics = {di.atomData.displayLabel(): di for di in info.dyninfos}
     if len(dynamics) != len(info.dyninfos):
         raise ValueError("Repeated dynamics labels need an explicit component mapping")
     if not settings.keys() <= dynamics.keys():
         raise ValueError("Custom liquid label absent from dynamics")
-
     for label, di in dynamics.items():
         expected = NC.Info.DI_VDOS if label in settings else NC.Info.DI_FreeGas
         if not isinstance(di, expected):
-            raise ValueError(
-                f"Unsupported liquid dynamics for {label}: {type(di).__name__}"
-            )
-
-    active = set(request["active_species"] or dynamics)
-    if not active <= dynamics.keys() or request["target"] not in active:
+            raise ValueError(f"Unsupported liquid dynamics for {label}: {type(di).__name__}")
+    active = set(request['active_species'] or dynamics)
+    if not active <= dynamics.keys() or request['target'] not in active:
         raise ValueError("Unknown active species or inactive analysis target")
-    if request["target"] not in settings:
+    if request['target'] not in settings:
         raise ValueError("Analysis target must have a captured liquid VDOS kernel")
     return dynamics, active
 
 
-def _load_captured_arrays(
-    root: Path,
-    filename: Path,
-    record: Dict[str, Any],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load captured ``(alpha, beta, sab)`` and component XS from binary or JSON.
+def _match_capture_species(record, dynamics, candidates):
+    """Identify a kernel by mass and bound cross section.
 
     Parameters
     ----------
-    root : pathlib.Path
-        Sandbox directory containing capture artifacts.
-    filename : pathlib.Path
-        Path to ``sab_XXXX.json``.
-    record : dict of str to Any
-        Parsed JSON metadata record.
+    record : dict
+        Parsed native kernel record.
+    dynamics : dict
+        Native dynamics by label.
+    candidates : iterable of str
+        Unmatched species with custom liquid kernels.
 
     Returns
     -------
-    alpha, beta, sab, component_xs : tuple of numpy.ndarray
-        Captured grids, 2-D ``S[beta, alpha]`` table, and 1-D cross sections.
+    str
+        Unique matching species label.
+    """
+    if record.get('layout') != 'sab[beta_index][alpha_index]':
+        raise ValueError("Unknown capture layout")
+    matches = [
+        label for label in candidates
+        if np.isclose(dynamics[label].atomData.averageMassAMU(),
+                      record['element_mass_amu'], rtol=1e-10, atol=0)
+        and np.isclose(dynamics[label].atomData.scatteringXS(),
+                       record['bound_xs_barn'], rtol=1e-10, atol=0)
+    ]
+    if len(matches) != 1:
+        raise ValueError("Ambiguous capture identity; refuse to infer label from order")
+    return matches[0]
+
+
+def _read_captured_kernels(files, arrays, settings, dynamics, temperature, energies, active):
+    """Decode kernels and accumulate fraction-weighted cross sections.
+
+    Parameters
+    ----------
+    files : sequence of pathlib.Path
+        Captured JSON paths in component-index order.
+    arrays : dict
+        Output arrays, updated with the decoded kernels.
+    settings, dynamics : dict
+        Custom liquid settings and native dynamics by label.
+    temperature : float
+        Requested temperature in kelvin.
+    energies : numpy.ndarray
+        Incident energies in eV.
+    active : set of str
+        Labels included in the selected scattering cross section.
+
+    Returns
+    -------
+    tuple
+        Component metadata, all liquid scattering, and selected liquid scattering.
+    """
+    components = {}
+    sum_xs, selected_xs = np.zeros_like(energies), np.zeros_like(energies)
+    for index, filename in enumerate(files):
+        record = json.loads(filename.read_text())
+        unmatched = (label for label in settings if label not in components)
+        label = _match_capture_species(record, dynamics, unmatched)
+        component, weighted_xs = _decode_captured_component(
+            filename, record, prefix=f"component_{index}", dynamics=dynamics[label],
+            temperature=temperature, energy_shape=energies.shape, arrays=arrays,
+        )
+        # Fractions refer to the original material even when only a subset is selected.
+        sum_xs += weighted_xs
+        if label in active:
+            selected_xs += weighted_xs
+        components[label] = component
+    return components, sum_xs, selected_xs
+
+
+def _decode_captured_component(
+    filename, record, *, prefix, dynamics, temperature, energy_shape, arrays,
+):
+    """Decode one kernel and read its fraction-weighted scattering values.
+
+    Parameters
+    ----------
+    filename : pathlib.Path
+        JSON kernel path used to locate the companion cross-section table.
+    record : dict
+        Parsed kernel record in beta-major layout.
+    prefix : str
+        Component key prefix in the binary handoff.
+    dynamics : NCrystal.Info.DI_VDOS
+        Native dynamics for the matched species.
+    temperature : float
+        Requested temperature in kelvin.
+    energy_shape : tuple of int
+        Shape of the incident energy grid.
+    arrays : dict
+        Output arrays, updated with this component's alpha, beta, and S values.
+
+    Returns
+    -------
+    tuple of (dict, numpy.ndarray)
+        Component metadata and weighted scattering cross sections in barns
+        per original material atom.
 
     Raises
     ------
     ValueError
-        If array dimensions or layouts are inconsistent.
+        If the captured temperature or cross-section table is inconsistent
+        with the request.
     """
-    if "binary_file" in record:
-        n_alpha = int(record["n_alpha"])
-        n_beta = int(record["n_beta"])
-        payload = np.fromfile(root / record["binary_file"], dtype=np.float64)
-        expected_size = n_alpha + n_beta + n_alpha * n_beta
-        if payload.size != expected_size:
-            raise ValueError("Corrupted binary SABData payload size")
-        alpha = payload[:n_alpha]
-        beta = payload[n_alpha : n_alpha + n_beta]
-        sab = payload[n_alpha + n_beta :].reshape((n_beta, n_alpha))
-    else:
-        alpha = np.asarray(record["alpha"], dtype=float)
-        beta = np.asarray(record["beta"], dtype=float)
-        sab = np.asarray(record["sab"], dtype=float)
+    if not np.isclose(record['temperature_K'], temperature, rtol=1e-12):
+        raise ValueError("Captured temperature differs from request")
+    for key in ('alpha', 'beta', 'sab'):
+        arrays[f"{prefix}_{key}"] = np.asarray(record[key], dtype=float)
 
-    stem_id = filename.stem.replace("sab_", "xs_")
-    xs_bin = root / f"{stem_id}.bin"
-    if xs_bin.is_file():
-        component_xs = np.fromfile(xs_bin, dtype=np.float64)
-    else:
-        xs_txt = root / f"{stem_id}.txt"
-        component_xs = np.loadtxt(xs_txt, ndmin=1)
-    return alpha, beta, sab, component_xs
+    xs_path = filename.with_name(filename.name.replace('sab_', 'xs_')).with_suffix('.txt')
+    component_xs = np.loadtxt(xs_path, ndmin=1)
+    if component_xs.shape != energy_shape:
+        raise ValueError("Incomplete component cross sections")
+    weighted_xs = component_xs * dynamics.fraction
+    component = {
+        "prefix": prefix, "mass_amu": record['element_mass_amu'],
+        "temperature": record['temperature_K'], "bound_xs": record['bound_xs_barn'],
+        "fraction": dynamics.fraction, "suggested_emax": record['suggested_emax_eV'],
+    }
+    return component, weighted_xs
 
 
-def _match_captured_components(
-    root: Path,
-    files: list[Path],
-    settings: Dict[str, Any],
-    dynamics: Dict[str, Any],
-    active: Set[str],
-    energies: np.ndarray,
-    requested_temperature: float,
-    arrays: Dict[str, np.ndarray],
-) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray]:
-    """Match captured kernels by mass and bound XS and accumulate weighted XS.
+def _include_free_gas(root, text, labels, temperature, energies, active, sum_xs, selected_xs):
+    """Add standard free-gas cross sections to the running totals.
 
     Parameters
     ----------
     root : pathlib.Path
-        Sandbox directory.
-    files : list of pathlib.Path
-        Captured ``sab_XXXX.json`` files.
-    settings : dict of str to LiquidAtomSettings
-        Parsed ``@CUSTOM_LIQUIDS`` settings.
-    dynamics : dict of str to Any
-        NCrystal ``DynInfo`` mapping.
-    active : set of str
-        Active species set.
-    energies : numpy.ndarray
-        Incident energy grid in eV.
-    requested_temperature : float
-        Requested temperature in kelvin.
-    arrays : dict of str to numpy.ndarray
-        Output array dictionary to populate in place.
-
-    Returns
-    -------
-    components : dict of str to dict
-        Matched component metadata keyed by element label.
-    sum_xs : numpy.ndarray
-        Full-material accumulated scattering cross section.
-    selected_xs : numpy.ndarray
-        Active-species accumulated scattering cross section.
-    """
-    components: Dict[str, Any] = {}
-    matched: Set[str] = set()
-    sum_xs = np.zeros_like(energies)
-    selected_xs = np.zeros_like(energies)
-
-    for index, filename in enumerate(files):
-        record = json.loads(filename.read_text(encoding="utf-8"))
-        if record.get("layout") != "sab[beta_index][alpha_index]":
-            raise ValueError("Unknown capture layout")
-
-        candidates = [
-            label
-            for label in settings
-            if label not in matched
-            and np.isclose(
-                dynamics[label].atomData.averageMassAMU(),
-                record["element_mass_amu"],
-                rtol=1e-10,
-                atol=0,
-            )
-            and np.isclose(
-                dynamics[label].atomData.scatteringXS(),
-                record["bound_xs_barn"],
-                rtol=1e-10,
-                atol=0,
-            )
-        ]
-        if len(candidates) != 1:
-            raise ValueError(
-                "Ambiguous capture identity; refuse to infer label from order"
-            )
-        label = candidates[0]
-        matched.add(label)
-        di = dynamics[label]
-
-        if not np.isclose(
-            record["temperature_K"], requested_temperature, rtol=1e-12
-        ):
-            raise ValueError("Captured temperature differs from request")
-
-        alpha, beta, sab, component_xs = _load_captured_arrays(
-            root, filename, record
-        )
-        if component_xs.shape != energies.shape:
-            raise ValueError("Incomplete component cross sections")
-
-        prefix = f"component_{index}"
-        arrays[f"{prefix}_alpha"] = alpha
-        arrays[f"{prefix}_beta"] = beta
-        arrays[f"{prefix}_sab"] = sab
-
-        weighted = component_xs * di.fraction
-        sum_xs += weighted
-        if label in active:
-            selected_xs += weighted
-
-        components[label] = {
-            "prefix": prefix,
-            "mass_amu": record["element_mass_amu"],
-            "temperature": record["temperature_K"],
-            "bound_xs": record["bound_xs_barn"],
-            "fraction": di.fraction,
-            "suggested_emax": record["suggested_emax_eV"],
-        }
-
-    return components, sum_xs, selected_xs
-
-
-def _evaluate_freegas_contributions(
-    root: Path,
-    text: str,
-    freegas_labels: Set[str],
-    active: Set[str],
-    temperature: float,
-    energies: np.ndarray,
-    sum_xs: np.ndarray,
-    selected_xs: np.ndarray,
-) -> None:
-    """Evaluate non-custom free-gas species and add their weighted cross sections.
-
-    Parameters
-    ----------
-    root : pathlib.Path
-        Sandbox directory.
+        Capture directory for temporary isolated NCMAT files.
     text : str
-        Full NCMAT text.
-    freegas_labels : set of str
-        Species modeled as ``DI_FreeGas``.
-    active : set of str
-        Active species set.
+        Original NCMAT content.
+    labels : set of str
+        Species handled by the standard free-gas backend.
     temperature : float
         Material temperature in kelvin.
     energies : numpy.ndarray
-        Incident neutron energy grid in eV.
-    sum_xs : numpy.ndarray
-        Full-material cross-section accumulator updated in place.
-    selected_xs : numpy.ndarray
-        Active-species cross-section accumulator updated in place.
+        Incident energies in eV.
+    active : set of str
+        Labels included in the selected scattering cross section.
+    sum_xs, selected_xs : numpy.ndarray
+        Material and selected scattering totals in barns, updated in place.
     """
-    if not freegas_labels:
-        return
-    stripped = re.sub(r"(?ms)^@CUSTOM_LIQUIDS\s*\n.*?(?=^@|\Z)", "", text)
-    for label in freegas_labels:
-        free_text = isolate_ncmat_dyninfo(stripped, {label})
+    # The plugin treats all non-custom species as free gas. Evaluate these via
+    # the standard backend, retaining their original material fractions.
+    for label in labels:
+        free_text = re.sub(r'(?ms)^@CUSTOM_LIQUIDS\s*\n.*?(?=^@|\Z)', '', text)
+        free_text = isolate_ncmat_dyninfo(free_text, {label})
         free_path = root / f"freegas_{label}.ncmat"
-        free_path.write_text(free_text, encoding="utf-8")
-        scatter = NC.createScatter(f"{free_path};temp={temperature:.17g}K")
-        free_xs = scatter.xsect(energies)
+        free_path.write_text(free_text)
+        free_xs = NC.createScatter(f"{free_path};temp={temperature:.17g}K").xsect(energies)
         sum_xs += free_xs
         if label in active:
             selected_xs += free_xs
 
 
-def _load_energy_grid(root: Path) -> np.ndarray:
-    """Load the incident cross-section energy grid from binary or text file.
+def _write_capture_result(root, arrays, components, target, text, active, request):
+    """Write the binary arrays and their provenance to the parent handoff.
 
     Parameters
     ----------
     root : pathlib.Path
-        Sandbox directory.
-
-    Returns
-    -------
-    numpy.ndarray
-        1-D incident energy grid in eV.
+        Capture directory.
+    arrays : dict
+        Evaluated cross sections, backend VDOS, and kernels.
+    components : dict
+        Kernel metadata keyed by species.
+    target : NCrystal.Info.DI_VDOS
+        Analysis target whose VDOS is used for thermodynamics.
+    text : str
+        Source NCMAT content for the material checksum.
+    active : set of str
+        Labels included in the selected scattering cross section.
+    request : dict
+        Capture request containing the target label and VDOS luxury level.
     """
-    bin_path = root / "energies.bin"
-    if bin_path.is_file():
-        return np.fromfile(bin_path, dtype=np.float64)
-    return np.loadtxt(root / "energies.txt", ndmin=1)
-
-
-def capture(request_path: str | Path) -> None:
-    """Capture kernels and native cross sections for one isolated material.
-
-    Parameters
-    ----------
-    request_path : str or pathlib.Path
-        JSON request path inside the sample sandbox.
-
-    Raises
-    ------
-    RuntimeError
-        If ABI checks, plugin selection, kernel counts, or cross-section
-        closure verification fail.
-    ValueError
-        If NCMAT dynamics or captured array values are invalid.
-    """
-    req_file = Path(request_path)
-    root = req_file.parent
-    request = json.loads(req_file.read_text(encoding="utf-8"))
-    _verify_child_library_environment(request["library_path"])
-
-    material = root / "material.ncmat"
-    text = material.read_text(encoding="utf-8")
-    settings = {item.atom: item for item in parse_custom_liquids(text)}
-    cfg = (
-        f"{material};temp={request['temperature']:.17g}K;"
-        f"vdoslux={request['vdoslux']}"
-    )
-
-    info = NC.createInfo(cfg)
-    dynamics, active = _validate_liquid_dyninfos(info, settings, request)
-    energies = _load_energy_grid(root)
-
-    mat = NC.load(cfg)
-    if "LiquidsModel" not in mat.scatter.getName():
-        raise RuntimeError("LiquidsModel was not selected")
-    # Disable further interception before evaluating free-gas helper NCMATs.
-    os.environ.pop("NCRYSTAL_SAB_DUMP_DIR", None)
-
-    files = sorted(root.glob("sab_*.json"))
-    if len(files) != len(settings):
-        raise RuntimeError(
-            f"Expected {len(settings)} kernels, captured {len(files)}"
-        )
-
-    arrays: Dict[str, np.ndarray] = {
-        "xs_energy": energies,
-        "xs_absorption": mat.absorption.xsect(energies),
-    }
-    components, sum_xs, selected_xs = _match_captured_components(
-        root=root,
-        files=files,
-        settings=settings,
-        dynamics=dynamics,
-        active=active,
-        energies=energies,
-        requested_temperature=float(request["temperature"]),
-        arrays=arrays,
-    )
-    _evaluate_freegas_contributions(
-        root=root,
-        text=text,
-        freegas_labels=dynamics.keys() - settings.keys(),
-        active=active,
-        temperature=float(request["temperature"]),
-        energies=energies,
-        sum_xs=sum_xs,
-        selected_xs=selected_xs,
-    )
-
-    native_xs = mat.scatter.xsect(energies)
-    if not np.allclose(sum_xs, native_xs, rtol=1e-9, atol=1e-10):
-        raise RuntimeError(
-            "Captured components do not reconstruct native material scattering"
-        )
-
-    arrays["xs_scattering"] = selected_xs
-    for key in ("xs_scattering", "xs_absorption"):
-        if not np.isfinite(arrays[key]).all() or np.any(arrays[key] < 0):
-            raise ValueError(f"Invalid {key}")
-
-    target = dynamics[request["target"]]
-    arrays["backend_energy_grid"] = target.vdos_egrid_expanded
-    arrays["backend_pdos"] = target.vdos_density
-    np.savez(root / "result.npz", **arrays)
-
+    # A bounded, binary handoff; text captures are discarded with the sandbox.
+    np.savez(root / 'result.npz', **arrays)
     metadata = {
-        "components": components,
-        "vdos_analysis": target.analyseVDOS(),
+        "components": components, "vdos_analysis": target.analyseVDOS(),
         "provenance": {
-            "ncrystal_version": NC.__version__,
-            "plugins": NC.plugins.browsePlugins(),
-            "plugin_hashes": {
-                path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
-                for _, path, kind in NC.plugins.browsePlugins()
-                if path and kind == "dynamic" and Path(path).is_file()
-            },
-            "material_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-            "active_species": sorted(active),
-            "target": request["target"],
-            "vdoslux": request["vdoslux"],
-            "capture": "SABScatter constructor",
+            "ncrystal_version": NC.__version__, "plugins": NC.plugins.browsePlugins(),
+            "plugin_hashes": {path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                              for _, path, kind in NC.plugins.browsePlugins()
+                              if path and kind == 'dynamic'},
+            "material_sha256": hashlib.sha256(text.encode()).hexdigest(),
+            "active_species": sorted(active), "target": request['target'],
+            "vdoslux": request['vdoslux'], "capture": "SABScatter constructor",
             "xs_scope": "selected species per original material atom",
             "absorption_scope": "whole material per atom",
             "sab_scope": "target species per atom",
             "raw_alpha_convention": "neutron mass",
             "analyzer_alpha_convention": "target atom mass",
             "beta_convention": "(Eout-Ein)/(k_B*T)",
-            "components": {
-                label: {
-                    key: value
-                    for key, value in component.items()
-                    if key != "prefix"
-                }
-                for label, component in components.items()
-            },
+            "components": {label: {key: value for key, value in component.items()
+                                    if key != 'prefix'}
+                           for label, component in components.items()},
             "thermodynamics_scope": "target solid-like VDOS only",
             "kinematic_normalization": "per unit target free scattering cross section",
         },
     }
-    (root / "result.json").write_text(json.dumps(metadata), encoding="utf-8")
+    (root / 'result.json').write_text(json.dumps(metadata))
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     capture(sys.argv[1])

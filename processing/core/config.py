@@ -48,26 +48,25 @@ class AceGenerationConfig:
         Elastic thermal reaction MT; ``None`` preserves the legacy
         ``elas_mat`` value and zero denotes no ACE elastic reaction.
     """
-
-    # Input evaluation and material identifiers.
+    # Source evaluation and material identifiers.
     base_endf_path: str
     base_za: int
     base_mat: int
     tsl_mat: int
 
-    # Thermal scattering settings.
+    # Thermal scattering controls.
     temperature: float
     icoh: int
     natom: int
     emax: float
 
-    # ACE table suffix and isotope identifiers.
+    # ACE table and isotope identifiers.
     suffix: str
     za1: int
     za2: int
     za3: int
 
-    # Elastic treatment and ACER controls.
+    # Elastic treatment and reaction options.
     elas_mat: int
     ielas: int
     nbin: int = 16
@@ -82,23 +81,36 @@ class AceGenerationConfig:
         ------
         FileNotFoundError
             If the base evaluation file does not exist.
+        ValueError
+            If the reaction identifiers are invalid or conflicting.
+        """
+        self._validate_reaction_ids()
+        if self.mte is None:
+            # Keep the legacy constructor's elastic MT when no override is supplied.
+            self.mte = self.elas_mat
+        if not Path(self.base_endf_path).is_file():
+            raise FileNotFoundError(
+                f"Base ENDF evaluation not found at: {self.base_endf_path}"
+            )
+
+    def _validate_reaction_ids(self) -> None:
+        """Check the compatible THERMR and ACER reaction identifiers.
+
+        Raises
+        ------
+        ValueError
+            If an MT identifier is invalid or the two elastic values disagree.
         """
         if type(self.mti) is not int or not 221 <= self.mti <= 250:
             raise ValueError("THERMR/ACER inelastic reaction mti must be an integer from 221 to 250.")
         if type(self.elas_mat) is not int or self.elas_mat < 0:
             raise ValueError("ACER elastic reaction elas_mat must be a nonnegative integer.")
         if self.mte is None:
-            # The legacy V1 API supplies the ACER elastic MT as ``elas_mat``.
-            self.mte = self.elas_mat
-        elif type(self.mte) is not int or self.mte < 0:
+            return
+        if type(self.mte) is not int or self.mte < 0:
             raise ValueError("ACER elastic reaction mte must be a nonnegative integer.")
-        elif self.mte != self.elas_mat:
+        if self.mte != self.elas_mat:
             raise ValueError("Conflicting ACER elastic reactions: mte and elas_mat must agree.")
-        if not Path(self.base_endf_path).is_file():
-            raise FileNotFoundError(
-                f"Base ENDF evaluation not found at: {self.base_endf_path}"
-            )
-
 
     @staticmethod
     def _positive_endf_identifier(raw, label: str) -> int:
@@ -259,6 +271,25 @@ class AceGenerationConfig:
                 "types. Their moderator ZA entries require explicit AceGenerationConfig settings."
             )
 
+        lthr = cls._read_elastic_flag(tape, sample_id)
+        return tsl_mat, natom, lthr, ns
+
+    @staticmethod
+    def _read_elastic_flag(tape, sample_id):
+        """Read and validate the optional MF7/MT2 LTHR flag.
+
+        Parameters
+        ----------
+        tape : Mapping
+            Parsed TSL ENDF evaluation.
+        sample_id : str
+            Sample identifier used in diagnostics.
+
+        Returns
+        -------
+        int
+            LTHR code, or zero when the elastic section is absent.
+        """
         elastic = tape.get(7, {}).get(2)
         try:
             lthr = int(elastic["LTHR"]) if elastic is not None else 0
@@ -266,7 +297,7 @@ class AceGenerationConfig:
             raise ValueError(f"Invalid MF7/MT2 elastic metadata for {sample_id}.") from exc
         if lthr not in (0, 1, 2, 3):
             raise ValueError(f"Unsupported MF7/MT2 LTHR={lthr} for {sample_id}.")
-        return tsl_mat, natom, lthr, ns
+        return lthr
 
     @classmethod
     def _read_shared_tsl_metadata(
@@ -340,6 +371,39 @@ class AceGenerationConfig:
             raise ValueError("ACE angular bin count must be a positive integer.")
         if not math.isfinite(tol) or tol <= 0:
             raise ValueError("ACE tolerance must be finite and positive.")
+
+    @staticmethod
+    def _resolve_inferred_reactions(lthr, mti, mte, allow_additional_scatterers):
+        """Resolve NJOY reaction identifiers from inferred elastic metadata.
+
+        Parameters
+        ----------
+        lthr : int
+            ENDF MF7/MT2 elastic treatment flag.
+        mti, mte : int or None
+            Optional inelastic and elastic MT overrides.
+        allow_additional_scatterers : bool
+            Whether the caller enabled support for additional scatterers.
+
+        Returns
+        -------
+        tuple of int
+            Resolved inelastic and elastic MT identifiers.
+        """
+        if allow_additional_scatterers and mti is None:
+            raise ValueError("Explicit ACER mti required for additional scatterer models.")
+        resolved_mti = 237 if mti is None else mti
+        resolved_mte = (
+            (resolved_mti + 1 if lthr else 0)
+            if mte is None else mte
+        )
+        if type(resolved_mte) is not int or resolved_mte < 0:
+            raise ValueError("ACER elastic reaction mte must be a nonnegative integer.")
+        if resolved_mte != 0 and not lthr:
+            raise ValueError("A nonzero ACER mte requires an MF7/MT2 elastic section.")
+        if lthr and resolved_mte != 0 and resolved_mte != resolved_mti + 1:
+            raise ValueError("ACER elastic mte must equal THERMR mti + 1 for this model.")
+        return resolved_mti, resolved_mte
 
     @classmethod
     def from_endf(
@@ -415,19 +479,9 @@ class AceGenerationConfig:
             parser, tsl_endf_files,
             allow_additional_scatterers=allow_additional_scatterers,
         )
-        if allow_additional_scatterers and mti is None:
-            raise ValueError("Explicit ACER mti required for additional scatterer models.")
-        resolved_mti = 237 if mti is None else mti
-        resolved_mte = (
-            (resolved_mti + 1 if lthr else 0)
-            if mte is None else mte
+        resolved_mti, resolved_mte = cls._resolve_inferred_reactions(
+            lthr, mti, mte, allow_additional_scatterers,
         )
-        if type(resolved_mte) is not int or resolved_mte < 0:
-            raise ValueError("ACER elastic reaction mte must be a nonnegative integer.")
-        if resolved_mte != 0 and not lthr:
-            raise ValueError("A nonzero ACER mte requires an MF7/MT2 elastic section.")
-        if lthr and resolved_mte != 0 and resolved_mte != resolved_mti + 1:
-            raise ValueError("ACER elastic mte must equal THERMR mti + 1 for this model.")
         return cls(
             base_endf_path=str(base_path),
             base_za=base_za,

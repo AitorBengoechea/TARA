@@ -118,29 +118,8 @@ class NjoyBatchOrchestrator:
         if not template_path.is_file():
             raise FileNotFoundError(f"LEAPR template not found: {template_path}")
 
-        # Validate and warn once, before launching any NJOY worker.
         template = LeaprFile.from_file(str(template_path))
-        if material_state == 'liquid':
-            # Match one authoritative temperature-dependent liquid block.
-            from input_output.leapr.material_adapter import material_model_from_leapr
-            material = material_model_from_leapr(
-                template, state='liquid', temperature=temperature,
-            )
-            output_temperature = material.temperature_k
-            if isinstance(ensemble, MaterialEnsemble):
-                reference = ensemble.reference
-                if abs(reference.temperature_k - output_temperature) > 1e-8:
-                    raise ValueError('Material ensemble reference temperature does not match LEAPR source.')
-                original = material.dynamics
-                actual = reference.dynamics
-                if (actual.translation_model != original.translation_model
-                    or abs(actual.translation_weight - original.translation_weight) > 1e-10
-                    or abs((actual.translation_parameter or 0.0) - (original.translation_parameter or 0.0)) > 1e-10):
-                    raise ValueError('Material ensemble reference translation differs from LEAPR source.')
-        elif material_state == 'solid':
-            output_temperature = resolve_leapr_temperature(template, temperature)
-        else:
-            raise ValueError('material_state must be solid or liquid.')
+        output_temperature = self._resolve_batch_temperature(template, temperature, material_state, ensemble)
 
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -157,6 +136,61 @@ class NjoyBatchOrchestrator:
 
         logger.info("Generated %d validated NJOY ENDF tapes.", len(results))
         return {sid: path for sid, path, _ in results}
+
+    def _resolve_batch_temperature(self, template, temperature, material_state, ensemble):
+        """Resolve the single output temperature before starting any NJOY workers.
+
+        Parameters
+        ----------
+        template : LeaprFile
+            Parsed LEAPR template.
+        temperature : float or None
+            Requested evaluation temperature in kelvin, if specified.
+        material_state : str
+            Solid or liquid source model.
+        ensemble : SpectraEnsemble or MaterialEnsemble
+            Ensemble with its original reference spectrum or material.
+
+        Returns
+        -------
+        float
+            Validated output temperature in kelvin.
+        """
+        # Validate and warn once, before launching any NJOY worker.
+        if material_state == 'liquid':
+            # Match one authoritative temperature-dependent liquid block.
+            from input_output.leapr.material_adapter import material_model_from_leapr
+            material = material_model_from_leapr(
+                template, state='liquid', temperature=temperature,
+            )
+            output_temperature = material.temperature_k
+            if isinstance(ensemble, MaterialEnsemble):
+                self._validate_liquid_reference(ensemble.reference, material)
+        elif material_state == 'solid':
+            output_temperature = resolve_leapr_temperature(template, temperature)
+        else:
+            raise ValueError('material_state must be solid or liquid.')
+
+        return output_temperature
+
+    @staticmethod
+    def _validate_liquid_reference(reference, material):
+        """Verify the sampled reference against the authoritative LEAPR liquid block.
+
+        Parameters
+        ----------
+        reference, material : MaterialScatteringModel
+            Ensemble reference and source material at the selected temperature.
+        """
+        if abs(reference.temperature_k - material.temperature_k) > 1e-8:
+            raise ValueError('Material ensemble reference temperature does not match LEAPR source.')
+        # The unperturbed reference carries the source translation parameters.
+        original = material.dynamics
+        actual = reference.dynamics
+        if (actual.translation_model != original.translation_model
+            or abs(actual.translation_weight - original.translation_weight) > 1e-10
+            or abs((actual.translation_parameter or 0.0) - (original.translation_parameter or 0.0)) > 1e-10):
+            raise ValueError('Material ensemble reference translation differs from LEAPR source.')
 
     def _leapr_generation_calls(
         self, ensemble: SpectraEnsemble | MaterialEnsemble, template_path: Path, output_dir: Path,
@@ -176,14 +210,16 @@ class NjoyBatchOrchestrator:
             ENDF destination.
         temperature : float
             Validated output temperature in kelvin.
+        material_state : str, default="solid"
+            Source model used when selecting the LEAPR temperature block.
+        export_full_spectra : bool, default=False
+            Write a full continuum spectrum with ND=0.
 
         Yields
         ------
         tuple
             Per-sample worker positional and keyword arguments.
         """
-        # Reserve sample_000 for the reference and start stochastic output names at
-        # sample_001.
         yield self._leapr_call(
             "sample_000", ensemble.reference, template_path, output_dir, temperature,
             material_state=material_state, export_full_spectra=export_full_spectra,
@@ -215,6 +251,10 @@ class NjoyBatchOrchestrator:
             ENDF destination.
         temperature : float
             Validated output temperature in kelvin.
+        material_state : str, default="solid"
+            Source model used when selecting the LEAPR temperature block.
+        export_full_spectra : bool, default=False
+            Write a full continuum spectrum with ND=0.
 
         Returns
         -------

@@ -289,10 +289,14 @@ def build_thermr_module(
         Already formatted temperature card text.
     tolerance_card : object
         Already formatted numerical-tolerance card text.
+
+    Returns
+    -------
+    str
+        THERMR deck text with logical tape assignments and request cards.
     """
     return "".join((
         "thermr\n",
-        # Use the shared free-format card writer while preserving this card’s terminator policy.
         format_njoy_card(input_tsl_tape, input_pendf_tape, output_tape),
         f"{control_card}\n",
         f"{temperature_card}\n",

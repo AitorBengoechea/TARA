@@ -29,21 +29,43 @@ class NjoyExecution:
 
     Parameters
     ----------
-    run_dir : Path
-        Working directory containing this execution's tapes.
+    run_dir : pathlib.Path
+        Active NJOY sandbox.
     stdout_text : str
-        Captured NJOY standard output.
+        Combined standard output and error from the process.
     """
 
     run_dir: Path
     stdout_text: str
 
     def tape_path(self, tape_name: str) -> Path:
-        """Return the path to a tape inside the active NJOY sandbox."""
+        """Return the path to a tape inside the active NJOY sandbox.
+
+        Parameters
+        ----------
+        tape_name : str
+            NJOY logical tape name, such as tape24.
+
+        Returns
+        -------
+        pathlib.Path
+            Path of the tape in the sandbox.
+        """
         return self.run_dir / tape_name
 
     def has_tape(self, tape_name: str) -> bool:
-        """Return whether a tape exists inside the active NJOY sandbox."""
+        """Return whether a tape exists inside the active NJOY sandbox.
+
+        Parameters
+        ----------
+        tape_name : str
+            NJOY logical tape name, such as tape24.
+
+        Returns
+        -------
+        bool
+            True if the tape exists as a file.
+        """
         return self.tape_path(tape_name).is_file()
 
 
@@ -85,13 +107,34 @@ class NjoyProcessor:
         self.base_mat: Optional[int] = None
         self._leapr_template: Optional[LeaprFile] = None
 
+        self._post_init(base_endf_file, base_leapr_file)
+
+    def _post_init(
+        self,
+        base_endf_file: Optional[str],
+        base_leapr_file: Optional[str],
+    ) -> None:
+        """Validate and load the optional transient analysis inputs.
+
+        Parameters
+        ----------
+        base_endf_file : str or None
+            Base neutron ENDF evaluation.
+        base_leapr_file : str or None
+            LEAPR template paired with the base evaluation.
+
+        Raises
+        ------
+        ValueError
+            If only one of the two input files is supplied.
+        """
         if (base_endf_file is None) != (base_leapr_file is None):
             raise ValueError(
                 "base_endf_file and base_leapr_file must be provided together "
                 "for transient NJOY analysis."
             )
 
-        if base_endf_file is not None:
+        if base_endf_file is not None and base_leapr_file is not None:
             self._initialize_analysis_template(
                 base_endf_file=base_endf_file,
                 base_leapr_file=base_leapr_file,
@@ -159,7 +202,23 @@ class NjoyProcessor:
 
     @staticmethod
     def _read_base_mat(base_endf_file: str) -> int:
-        """Read MAT from the standard ENDF MF=1/MT=451 header."""
+        """Read MAT from the standard ENDF MF=1/MT=451 header.
+
+        Parameters
+        ----------
+        base_endf_file : str
+            Path to the base neutron evaluation.
+
+        Returns
+        -------
+        int
+            MAT identifier from MF1/MT451.
+
+        Raises
+        ------
+        ValueError
+            If the header has no valid MAT identifier.
+        """
         tape_data = EndfParserPy().parsefile(base_endf_file)
         try:
             return int(tape_data[1][451]["MAT"])
@@ -171,7 +230,18 @@ class NjoyProcessor:
 
     @staticmethod
     def _validate_tape_name(tape_name: str) -> None:
-        """Reject paths and malformed logical-tape names."""
+        """Reject paths and malformed logical-tape names.
+
+        Parameters
+        ----------
+        tape_name : str
+            Requested filename within the sandbox.
+
+        Raises
+        ------
+        ValueError
+            If the name does not match the tapeNN convention.
+        """
         if (
             not tape_name.startswith("tape")
             or tape_name != Path(tape_name).name
@@ -225,34 +295,18 @@ class NjoyProcessor:
 
         Yields
         ------
-        Iterator[NjoyExecution]
-            Transient NJOY execution context.
+        NjoyExecution
+            Transient execution and its sandbox.
         """
+        # NJOY uses fixed tape names, so give each execution its own directory.
         run_id = uuid.uuid4().hex[:8]
-        # NJOY uses fixed tape names, so each execution needs its own working directory.
         run_dir = self.temp_dir / f"njoy_{run_id}"
         run_dir.mkdir(parents=True, exist_ok=True)
 
         try:
             self._stage_input_tapes(run_dir, input_tapes)
 
-            process = subprocess.Popen(
-                [str(self.njoy_exec)],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                cwd=str(run_dir),
-                text=True,
-            )
-            stdout_text, _ = process.communicate(input=deck)
-            stdout_text = stdout_text or ""
-
-            # Check the NJOY transcript as well as the exit status before exposing the
-            # tapes.
-            if process.returncode != 0 or "error" in stdout_text.lower():
-                raise RuntimeError(
-                    f"NJOY execution failed.\nOutput:\n{stdout_text}"
-                )
+            stdout_text = self._run_deck(run_dir, deck)
 
             yield NjoyExecution(
                 run_dir=run_dir,
@@ -260,6 +314,40 @@ class NjoyProcessor:
             )
         finally:
             shutil.rmtree(str(run_dir), ignore_errors=True)
+
+    def _run_deck(self, run_dir, deck):
+        """Send the deck to NJOY and validate its process result.
+
+        Parameters
+        ----------
+        run_dir : pathlib.Path
+            Isolated directory with staged NJOY inputs.
+        deck : str
+            NJOY deck text passed on standard input.
+
+        Returns
+        -------
+        str
+            The captured NJOY output.
+        """
+        process = subprocess.Popen(
+            [str(self.njoy_exec)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=str(run_dir),
+            text=True,
+        )
+        stdout_text, _ = process.communicate(input=deck)
+        stdout_text = stdout_text or ""
+
+        # Some NJOY errors appear only in the transcript.
+        if process.returncode != 0 or "error" in stdout_text.lower():
+            raise RuntimeError(
+                f"NJOY execution failed.\nOutput:\n{stdout_text}"
+            )
+
+        return stdout_text
 
     @contextmanager
     def execute_analysis(
@@ -387,7 +475,6 @@ class NjoyProcessor:
         """
         leapr_mat = int(self._leapr_template.material_info["mat"])
         thermr_natom = int(self._leapr_template.principal_scatterer["npr"])
-        # Carry the template's elastic setting into the THERMR analysis deck.
         thermr_icoh = (
             1 if int(self._leapr_template.principal_scatterer.get("iel", 0)) != 0 else 0
         )
@@ -411,7 +498,15 @@ class NjoyProcessor:
             yield execution
 
     def execute_leapr(self, leapr_deck: str, output_endf_path: str) -> None:
-        """Execute a LEAPR deck and persist the generated ``tape24``."""
+        """Execute a LEAPR deck and persist the generated ``tape24``.
+
+        Parameters
+        ----------
+        leapr_deck : str
+            LEAPR deck that writes tape24.
+        output_endf_path : str
+            Destination ENDF path.
+        """
         self._run_njoy_sandbox(
             leapr_deck,
             target_tape="tape24",
@@ -460,24 +555,7 @@ class NjoyProcessor:
                 ace_deck,
                 input_tapes={"tape20": base_endf_path, "tape70": tsl_endf_path},
             ) as execution:
-                ace_tape = execution.tape_path("tape40")
-                if not ace_tape.is_file() or ace_tape.stat().st_size == 0:
-                    raise FileNotFoundError(
-                        f"NJOY did not generate a nonempty ACE tape40. "
-                        f"Output:\n{execution.stdout_text}"
-                    )
-                # Guard against accidentally extracting a short XSDIR index
-                # entry as an ACE library again.
-                with ace_tape.open("rb") as source:
-                    if b"filename route" in source.read(1024).lower():
-                        raise ValueError("NJOY ACE tape40 contains an XSDIR entry, not ACE data.")
-                if save_xsdir:
-                    index_tape = execution.tape_path("tape41")
-                    if not index_tape.is_file() or index_tape.stat().st_size == 0:
-                        raise FileNotFoundError(
-                            f"NJOY did not generate a nonempty XSDIR tape41. "
-                            f"Output:\n{execution.stdout_text}"
-                        )
+                ace_tape, index_tape = self._validate_acer_tapes(execution, save_xsdir)
                 ace_target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ace_tape, ace_target)
                 if save_xsdir:
@@ -487,6 +565,43 @@ class NjoyProcessor:
             ace_target.unlink(missing_ok=True)
             xsdir_target.unlink(missing_ok=True)
             raise
+
+    @staticmethod
+    def _validate_acer_tapes(execution, save_xsdir):
+        """Validate ACER's ACE library and optional index tape.
+
+        Parameters
+        ----------
+        execution : NjoyExecution
+            Completed NJOY execution with access to its sandbox.
+        save_xsdir : bool
+            Whether the XSDIR index is required.
+
+        Returns
+        -------
+        tuple of pathlib.Path and pathlib.Path or None
+            ACE tape path and optional XSDIR tape path.
+        """
+        ace_tape = execution.tape_path("tape40")
+        if not ace_tape.is_file() or ace_tape.stat().st_size == 0:
+            raise FileNotFoundError(
+                f"NJOY did not generate a nonempty ACE tape40. "
+                f"Output:\n{execution.stdout_text}"
+            )
+        # Guard against accidentally extracting a short XSDIR index
+        # entry as an ACE library again.
+        with ace_tape.open("rb") as source:
+            if b"filename route" in source.read(1024).lower():
+                raise ValueError("NJOY ACE tape40 contains an XSDIR entry, not ACE data.")
+        index_tape = None
+        if save_xsdir:
+            index_tape = execution.tape_path("tape41")
+            if not index_tape.is_file() or index_tape.stat().st_size == 0:
+                raise FileNotFoundError(
+                    f"NJOY did not generate a nonempty XSDIR tape41. "
+                    f"Output:\n{execution.stdout_text}"
+                )
+        return ace_tape, index_tape
 
     def _run_njoy_sandbox(
         self,

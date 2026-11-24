@@ -57,7 +57,7 @@ class NCrystalAnalysisState:
         Prepared scattering handles when component loading is requested.
     """
 
-    # Material source and loaded target.
+    # Temporary source and loaded analysis target.
     filepath: str
     target_lbl: str
     mat: Any
@@ -68,12 +68,12 @@ class NCrystalAnalysisState:
     energy_grid: np.ndarray
     pdos: np.ndarray
 
-    # Native scattering handles.
+    # Native scattering components.
     scatter_inelastic: Optional[Any] = None
     scatter_coherent_elastic: Optional[Any] = None
     scatter_incoherent_elastic: Optional[Any] = None
 
-    # Backend vibrational spectrum.
+    # Spectrum passed to the NCMAT composer.
     backend_energy_grid: Optional[np.ndarray] = None
     backend_pdos: Optional[np.ndarray] = None
 
@@ -96,6 +96,11 @@ def prepare_ncrystal_vdos(
     The returned density is rescaled to preserve its integral over the
     retained physical-energy interval after interpolation.
 
+    Parameters
+    ----------
+    spectrum : PhononSpectra
+        TARA energy grid in eV and its sampled vibrational density.
+
     Returns
     -------
     energy_grid, density : ndarray
@@ -105,6 +110,22 @@ def prepare_ncrystal_vdos(
     energy_grid = np.asarray(spectrum.energy_grid, dtype=np.float64)
     density = np.asarray(spectrum.density_values, dtype=np.float64)
 
+    _validate_vdos_arrays(energy_grid, density)
+    energy_grid, density = _remove_synthetic_debye_prefix(
+        energy_grid, density, spectrum.original_starts_at_zero,
+    )
+    energy_grid, density = _retain_physical_vdos_points(energy_grid, density)
+    return _regularize_vdos_grid(energy_grid, density)
+
+
+def _validate_vdos_arrays(energy_grid, density):
+    """Validate the sampled energy and density arrays.
+
+    Parameters
+    ----------
+    energy_grid, density : numpy.ndarray
+        Paired one-dimensional VDOS arrays on an energy grid in eV.
+    """
     if energy_grid.ndim != 1 or density.shape != energy_grid.shape:
         raise ValueError("NCrystal VDOS: energy and density must be paired 1D arrays")
     if energy_grid.size < 3:
@@ -116,10 +137,26 @@ def prepare_ncrystal_vdos(
     if np.any(density < 0):
         raise ValueError("NCrystal VDOS: density must be nonnegative")
 
+
+def _remove_synthetic_debye_prefix(energy_grid, density, original_starts_at_zero):
+    """Identify and drop the synthetic low-energy prefix.
+
+    Parameters
+    ----------
+    energy_grid, density : numpy.ndarray
+        Paired one-dimensional VDOS arrays on an energy grid in eV.
+    original_starts_at_zero : bool
+        Whether the source spectrum began at zero.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Energy grid in eV and the corresponding density.
+    """
     # PhononSpectra prepends exactly one origin point and 2,000 quadratic
     # interior points to a positive-origin input. Check the stored flag and
     # the tail's values before discarding this known synthetic region.
-    if not spectrum.original_starts_at_zero:
+    if not original_starts_at_zero:
         n_prefix = 2001
         if energy_grid.size < n_prefix + 3 or energy_grid[0] != 0.0:
             raise ValueError("NCrystal VDOS: unexpected reconstructed Debye-tail layout")
@@ -155,6 +192,22 @@ def prepare_ncrystal_vdos(
             energy_grid = energy_grid[first_native_index:]
             density = density[first_native_index:]
 
+    return energy_grid, density
+
+
+def _retain_physical_vdos_points(energy_grid, density):
+    """Keep the energy points accepted by the NCrystal VDOS composer.
+
+    Parameters
+    ----------
+    energy_grid, density : numpy.ndarray
+        Paired one-dimensional VDOS arrays on an energy grid in eV.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Energy grid in eV and the corresponding density.
+    """
     # Omit the exact zero point and truly subthreshold physical points. NCrystal
     # extrapolates the Debye region itself from the first retained point.
     retained = energy_grid >= MIN_NCRYSTAL_VDOS_ENERGY_EV
@@ -163,6 +216,22 @@ def prepare_ncrystal_vdos(
     if energy_grid.size < 3:
         raise ValueError("NCrystal VDOS: fewer than three physical points >=1e-5 eV")
 
+    return energy_grid, density
+
+
+def _regularize_vdos_grid(energy_grid, density):
+    """Interpolate a nonuniform grid while preserving its retained integral.
+
+    Parameters
+    ----------
+    energy_grid, density : numpy.ndarray
+        Paired one-dimensional VDOS arrays on an energy grid in eV.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Energy grid in eV and the corresponding density.
+    """
     spacing = float((energy_grid[-1] - energy_grid[0]) / (energy_grid.size - 1))
     if not np.isfinite(spacing) or spacing <= 0:
         raise ValueError("NCrystal VDOS: invalid energy-grid spacing")
@@ -199,13 +268,6 @@ def reconstruct_debye_tail(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstruct the quadratic Debye tail below the first NCrystal point.
 
-    The reconstruction assumes
-
-    ``rho(E) = rho_1 * (E / E_1)**2``
-
-    so the added tail joins continuously to the first retained NCrystal VDOS
-    point.
-
     Parameters
     ----------
     energy_grid : numpy.ndarray
@@ -213,18 +275,69 @@ def reconstruct_debye_tail(
     density_values : numpy.ndarray
         Density values corresponding to ``energy_grid``.
     n_points : int, default=2000
-        Number of points inserted below the first retained energy.
+        Number of points added from zero up to the first retained energy,
+        excluding that energy.
 
     Returns
     -------
     full_energy_grid : numpy.ndarray
-        Energy grid extended down to zero.
+        Energy grid extended down to zero in eV.
     full_density_values : numpy.ndarray
         Density values including the reconstructed Debye tail.
+
+    Raises
+    ------
+    ValueError
+        If the arrays are not one-dimensional or have different lengths,
+        the energy grid is empty or starts at a nonpositive energy, or
+        fewer than two tail points are requested.
+
+    Notes
+    -----
+    The continuation ``rho(E) = rho_1 * (E / E_1)**2`` joins continuously
+    to the first retained point ``(E_1, rho_1)``.
     """
     energy_grid = np.asarray(energy_grid, dtype=np.float64)
     density_values = np.asarray(density_values, dtype=np.float64)
+    _validate_debye_tail_inputs(energy_grid, density_values, n_points)
 
+    first_energy = float(energy_grid[0])
+    first_density = float(density_values[0])
+
+    # The original grid already contains the joining point.
+    tail_energy = np.linspace(
+        0.0, first_energy, n_points + 1, dtype=np.float64
+    )[:-1]
+    tail_density = first_density * (tail_energy / first_energy) ** 2
+
+    return (
+        np.concatenate((tail_energy, energy_grid)),
+        np.concatenate((tail_density, density_values)),
+    )
+
+
+def _validate_debye_tail_inputs(
+    energy_grid: np.ndarray,
+    density_values: np.ndarray,
+    n_points: int,
+) -> None:
+    """Validate the paired input arrays and requested tail length.
+
+    Parameters
+    ----------
+    energy_grid : numpy.ndarray
+        Source energy grid in eV.
+    density_values : numpy.ndarray
+        Density values paired with the source energies.
+    n_points : int
+        Number of points to add below the first source energy.
+
+    Raises
+    ------
+    ValueError
+        If the array dimensions or lengths disagree, the energy grid is
+        empty or starts at a nonpositive energy, or ``n_points`` is below two.
+    """
     if energy_grid.ndim != 1 or density_values.ndim != 1:
         raise ValueError("energy_grid and density_values must be one-dimensional.")
     if energy_grid.size != density_values.size:
@@ -233,22 +346,6 @@ def reconstruct_debye_tail(
         raise ValueError("The first NCrystal VDOS energy must be strictly positive.")
     if n_points < 2:
         raise ValueError("n_points must be at least 2.")
-
-    first_energy = float(energy_grid[0])
-    first_density = float(density_values[0])
-
-    tail_energy = np.linspace(
-        0.0,
-        first_energy,
-        n_points + 1,
-        dtype=np.float64,
-    )[:-1]
-    tail_density = first_density * (tail_energy / first_energy) ** 2
-
-    return (
-        np.concatenate((tail_energy, energy_grid)),
-        np.concatenate((tail_density, density_values)),
-    )
 
 
 class UnsupportedLiquidAceExport(NotImplementedError):
@@ -262,9 +359,9 @@ class NCrystalNativeState:
     Parameters
     ----------
     cfgstr : str
-        Configuration string used to load the native scattering object.
-    scatter : Any
-        Loaded native NCrystal scattering object.
+        Material configuration used for native scattering.
+    scatter : object
+        Loaded NCrystal scattering handle.
     """
 
     cfgstr: str
@@ -295,49 +392,124 @@ def verify_liquids_plugin(*, command: str = "nctool") -> str:
     return output
 
 
-def sampled_kinematics(incident_energy_ev: float, outgoing_energy_ev,
-                       cosine_scatter, *, temperature_k: float,
-                       target_mass_ratio: float = 1.0) -> dict[str, np.ndarray]:
-    """Return native event Q, energy transfer, alpha and beta diagnostics.
-
-    Event histograms are NOT normalised S(alpha,beta) or S(Q,omega) tables.
-    For multi-species systems, the target mass must be explicitly chosen.
+def sampled_kinematics(
+    incident_energy_ev: float,
+    outgoing_energy_ev,
+    cosine_scatter,
+    *,
+    temperature_k: float,
+    target_mass_ratio: float = 1.0,
+) -> dict[str, np.ndarray]:
+    """Compute momentum and energy transfer for sampled scattering events.
 
     Parameters
     ----------
     incident_energy_ev : float
-        Incident neutron energy in electronvolts.
-    outgoing_energy_ev : object
-        Outgoing neutron energy or energies in electronvolts.
-    cosine_scatter : object
-        Scattering-angle cosine or cosines.
+        Incident neutron energy in eV.
+    outgoing_energy_ev : array_like
+        One-dimensional outgoing neutron energies in eV.
+    cosine_scatter : array_like
+        Scattering-angle cosines with the same shape as the outgoing energies.
     temperature_k : float
-        Physical temperature in kelvin.
-    target_mass_ratio : float
-        Neutron-target mass ratio used in event diagnostics.
+        Material temperature in kelvin.
+    target_mass_ratio : float, default=1.0
+        Ratio of target mass to neutron mass. Choose the target species
+        explicitly for a multi-species material.
 
     Returns
     -------
-    dict[str, np.ndarray]
-        Event diagnostic arrays for energy transfer, Q, alpha, and beta.
+    dict of str to numpy.ndarray
+        Event-wise momentum transfer in inverse angstroms, energy transfer
+        in eV, and dimensionless alpha and beta.
+
+    Raises
+    ------
+    ValueError
+        If the scalar conditions or event arrays are invalid.
+
+    Notes
+    -----
+    Positive energy transfer corresponds to neutron energy loss. These
+    event diagnostics can be histogrammed to visualize sampled events.
     """
-    if (not math.isfinite(incident_energy_ev) or incident_energy_ev <= 0
-            or not math.isfinite(temperature_k) or temperature_k <= 0
-            or not math.isfinite(target_mass_ratio) or target_mass_ratio <= 0):
-        raise ValueError("Incident energy, temperature, mass ratio must be positive.")
-    eo = np.asarray(outgoing_energy_ev, dtype=float)
-    mu = np.asarray(cosine_scatter, dtype=float)
-    if (eo.ndim != 1 or mu.shape != eo.shape or not np.isfinite(eo).all()
-            or not np.isfinite(mu).all() or np.any(eo < 0)
-            or np.any(np.abs(mu) > 1.000001)):
-        raise ValueError("Invalid outgoing energies or scattering angles.")
-    q_energy = np.maximum(incident_energy_ev + eo
-                          - 2 * np.sqrt(incident_energy_ev * eo) * np.clip(mu, -1, 1), 0)
+    _validate_kinematic_conditions(
+        incident_energy_ev, temperature_k, target_mass_ratio,
+    )
+    outgoing = np.asarray(outgoing_energy_ev, dtype=float)
+    cosine = np.asarray(cosine_scatter, dtype=float)
+    _validate_scattering_events(outgoing, cosine)
+
+    # Clip small cosine overshoots and guard against negative roundoff at Q=0.
+    q_energy = np.maximum(
+        incident_energy_ev + outgoing
+        - 2 * np.sqrt(incident_energy_ev * outgoing) * np.clip(cosine, -1, 1),
+        0,
+    )
+    energy_transfer = incident_energy_ev - outgoing
     kbt = 8.617333262145e-5 * temperature_k
-    return {"q_inv_angstrom": np.sqrt(q_energy / 0.002072124855),
-            "energy_transfer_ev": incident_energy_ev - eo,
-            "alpha": q_energy / (target_mass_ratio * kbt),
-            "beta": (incident_energy_ev - eo) / kbt}
+
+    return {
+        "q_inv_angstrom": np.sqrt(q_energy / 0.002072124855),
+        "energy_transfer_ev": energy_transfer,
+        "alpha": q_energy / (target_mass_ratio * kbt),
+        "beta": energy_transfer / kbt,
+    }
+
+
+def _validate_kinematic_conditions(
+    incident_energy_ev: float,
+    temperature_k: float,
+    target_mass_ratio: float,
+) -> None:
+    """Validate the scalar conditions shared by all sampled events.
+
+    Parameters
+    ----------
+    incident_energy_ev : float
+        Incident neutron energy in eV.
+    temperature_k : float
+        Material temperature in kelvin.
+    target_mass_ratio : float
+        Ratio of target mass to neutron mass.
+
+    Raises
+    ------
+    ValueError
+        If any condition is nonfinite or nonpositive.
+    """
+    conditions = (incident_energy_ev, temperature_k, target_mass_ratio)
+    if not all(math.isfinite(value) and value > 0 for value in conditions):
+        raise ValueError("Incident energy, temperature, mass ratio must be positive.")
+
+
+def _validate_scattering_events(
+    outgoing: np.ndarray,
+    cosine: np.ndarray,
+) -> None:
+    """Validate the paired arrays of outgoing energies and angle cosines.
+
+    Parameters
+    ----------
+    outgoing : numpy.ndarray
+        One-dimensional outgoing neutron energies in eV.
+    cosine : numpy.ndarray
+        Scattering-angle cosines paired with the outgoing energies.
+
+    Raises
+    ------
+    ValueError
+        If the arrays have incompatible shapes, contain nonfinite values,
+        include negative energies, or contain cosines outside the tolerance.
+    """
+    if (
+        outgoing.ndim != 1
+        or cosine.shape != outgoing.shape
+        or not np.isfinite(outgoing).all()
+        or not np.isfinite(cosine).all()
+        or np.any(outgoing < 0)
+        or np.any(np.abs(cosine) > 1.000001)
+    ):
+        raise ValueError("Invalid outgoing energies or scattering angles.")
 
 
 class NcrystalProcessor:
@@ -465,19 +637,7 @@ class NcrystalProcessor:
                 spectrum,
                 atom_label,
             )
-            if self.active_species is not None and target_lbl not in self.active_species:
-                raise ValueError(
-                    f"Analysis target {target_lbl!r} must belong to active_species "
-                    f"{sorted(self.active_species)!r}."
-                )
-            composer.write(str(temp_filename))
-            if self.active_species is not None:
-                # Isolation is NCrystal execution configuration, not LEAPR / NCMAT
-                # input conversion. Change only the freshly written temp file.
-                ncmat_text = temp_filename.read_text(encoding="utf-8")
-                isolated = isolate_ncmat_dyninfo(ncmat_text, self.active_species)
-                temp_filename.write_text(isolated, encoding="utf-8")
-            NC.clearCaches()
+            self._write_analysis_material(composer, temp_filename, target_lbl)
 
             reading = f"{temp_filename};temp={self.temperature:.1f}K"
             mat = NC.load(reading)
@@ -492,15 +652,10 @@ class NcrystalProcessor:
             neutron_mass_amu = physical_constants["neutron mass in u"][0]
             mass_amu = nuc_data.elements[target_lbl]._awr * neutron_mass_amu
 
-            scatter_inelastic = scatter_coherent_elastic = scatter_incoherent_elastic = None
-            if load_scattering_components:
-                from NCrystal.misc import MaterialSource
-
-                source = MaterialSource(reading)
-                scatter_inelastic, scatter_coherent_elastic, scatter_incoherent_elastic = (
-                    source.load(f"comp={component}", doInfo=False, doAbsorption=False).scatter
-                    for component in ("inelas", "coh_elas", "incoh_elas")
-                )
+            scatter_inelastic, scatter_coherent_elastic, scatter_incoherent_elastic = (
+                self._load_scattering_components(reading) if load_scattering_components
+                else (None, None, None)
+            )
 
             target_spectrum = spectrum[target_lbl] if isinstance(spectrum, dict) else spectrum
             return NCrystalAnalysisState(
@@ -520,6 +675,54 @@ class NcrystalProcessor:
         except Exception:
             self.cleanup_analysis_file(str(temp_filename))
             raise
+
+    def _write_analysis_material(self, composer, temp_filename, target_lbl):
+        """Write the temporary material and apply optional species isolation.
+
+        Parameters
+        ----------
+        composer : NCrystal.NCMATComposer
+            Material with the requested spectra injected.
+        temp_filename : pathlib.Path
+            Destination for the isolated material.
+        target_lbl : str
+            Target NCMAT species label.
+        """
+        if self.active_species is not None and target_lbl not in self.active_species:
+            raise ValueError(
+                f"Analysis target {target_lbl!r} must belong to active_species "
+                f"{sorted(self.active_species)!r}."
+            )
+        composer.write(str(temp_filename))
+        if self.active_species is not None:
+            # Isolation is NCrystal execution configuration, not LEAPR / NCMAT
+            # input conversion. Change only the freshly written temp file.
+            ncmat_text = temp_filename.read_text(encoding="utf-8")
+            isolated = isolate_ncmat_dyninfo(ncmat_text, self.active_species)
+            temp_filename.write_text(isolated, encoding="utf-8")
+        NC.clearCaches()
+
+    @staticmethod
+    def _load_scattering_components(reading):
+        """Load the three independent native scattering handles.
+
+        Parameters
+        ----------
+        reading : str
+            NCrystal material configuration including temperature.
+
+        Returns
+        -------
+        tuple
+            Inelastic, coherent elastic, and incoherent elastic handles.
+        """
+        from NCrystal.misc import MaterialSource
+
+        source = MaterialSource(reading)
+        return tuple(
+            source.load(f"comp={component}", doInfo=False, doAbsorption=False).scatter
+            for component in ("inelas", "coh_elas", "incoh_elas")
+        )
 
     @staticmethod
     def _inject_spectra(
@@ -792,7 +995,15 @@ class NcrystalProcessor:
 
     @staticmethod
     def export_native_liquid_ace(*args, **kwargs) -> None:
-        """Reject unvalidated conversion of the plugin convolution to ACE."""
+        """Reject unvalidated conversion of the plugin convolution to ACE.
+
+        Parameters
+        ----------
+        *args : tuple
+            Positional arguments supplied by a caller.
+        **kwargs : dict
+            Keyword arguments supplied by a caller.
+        """
         raise UnsupportedLiquidAceExport(
             "NCrystal Liquids plugin-to-ENDF/ACE conversion has not been verified. "
             "Use native NCrystal output, or independently evaluated NJOY LEAPR/ACE."

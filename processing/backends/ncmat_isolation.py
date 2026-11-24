@@ -19,6 +19,23 @@ def normalize_active_species(active_species: Collection[str]) -> FrozenSet[str]:
     A bare string is rejected to prevent accidentally iterating its letters.
     Multiple ``@DYNINFO`` blocks can have the same element label; all are
     selected together.  Labels are case-sensitive, as in NCMAT.
+
+    Parameters
+    ----------
+    active_species : collection of str
+        Requested case-sensitive NCMAT element labels.
+
+    Returns
+    -------
+    frozenset of str
+        Unique validated labels.
+
+    Raises
+    ------
+    TypeError
+        If the input is a bare string or is not a collection.
+    ValueError
+        If the collection is empty or contains invalid labels.
     """
     if isinstance(active_species, (str, bytes)) or not isinstance(active_species, Collection):
         raise TypeError("active_species must be a nonempty collection of NCMAT element labels")
@@ -37,11 +54,25 @@ def isolate_ncmat_dyninfo(ncmat_text: str, active_species: Collection[str]) -> s
     exact fraction lines.  The original source material must not be modified:
     callers should apply this to generated, transient NCMAT text only.
 
+    Parameters
+    ----------
+    ncmat_text : str
+        Generated NCMAT content.
+    active_species : collection of str
+        Element labels to retain as scattering-active.
+
+    Returns
+    -------
+    str
+        NCMAT content with original fractions and inactive species made sterile.
+
     Raises
     ------
     ValueError
         If the NCMAT has malformed dynamics sections, an unknown selected
         species, or a selected species that is already sterile.
+    TypeError
+        If the input text or the selected-label collection has the wrong type.
     """
     active = normalize_active_species(active_species)
     if not isinstance(ncmat_text, str):
@@ -63,18 +94,7 @@ def isolate_ncmat_dyninfo(ncmat_text: str, active_species: Collection[str]) -> s
         n_dyninfo += 1
         result.extend(lines[cursor:start])
         block = lines[start:end]
-        fields = {}
-        raw_fields = {}
-        for line in block[1:]:
-            field_match = _FIELD_RE.match(line)
-            if field_match:
-                key, value = field_match.groups()
-                if key in fields:
-                    raise ValueError(f"Repeated {key!r} in NCMAT @DYNINFO")
-                fields[key] = value
-                raw_fields[key] = line
-        if not {'element', 'fraction', 'type'} <= fields.keys():
-            raise ValueError("Each NCMAT @DYNINFO needs element, fraction, and type")
+        fields, raw_fields = _read_dyninfo_fields(block)
         label = fields['element']
         seen.add(label)
         if label in active:
@@ -96,3 +116,31 @@ def isolate_ncmat_dyninfo(ncmat_text: str, active_species: Collection[str]) -> s
         raise ValueError(f"Unknown active_species in NCMAT: {sorted(unknown)!r}; available: {sorted(seen)!r}")
     result.extend(lines[cursor:])
     return ''.join(result)
+
+
+def _read_dyninfo_fields(block):
+    """Read the required dynamics fields and their original lines.
+
+    Parameters
+    ----------
+    block : sequence of str
+        NCMAT DYNINFO lines, beginning with the section header.
+
+    Returns
+    -------
+    tuple of dict
+        Parsed values and original lines indexed by field name.
+    """
+    fields = {}
+    raw_fields = {}
+    for line in block[1:]:
+        field_match = _FIELD_RE.match(line)
+        if field_match:
+            key, value = field_match.groups()
+            if key in fields:
+                raise ValueError(f"Repeated {key!r} in NCMAT @DYNINFO")
+            fields[key] = value
+            raw_fields[key] = line
+    if not {'element', 'fraction', 'type'} <= fields.keys():
+        raise ValueError("Each NCMAT @DYNINFO needs element, fraction, and type")
+    return fields, raw_fields

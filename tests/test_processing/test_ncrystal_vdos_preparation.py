@@ -1,27 +1,13 @@
 """NCrystal VDOS preparation and numerical representation checks."""
 
-
-from pathlib import Path
-import ast
 import numpy as np
 import pytest
 
 
+from processing.backends.ncrystal_processor import prepare_ncrystal_vdos
+
+
 # VDOS source-grid contract
-
-PROCESSOR_FILE = Path(__file__).resolve().parents[2] / 'processing/backends/ncrystal_processor.py'
-
-def _helper():
-    tree = ast.parse(PROCESSOR_FILE.read_text())
-    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'prepare_ncrystal_vdos')
-    node.decorator_list = []
-    node.returns = None
-    node.args.args[0].annotation = None
-    namespace = {'np':np, 'MIN_NCRYSTAL_VDOS_ENERGY_EV': 1e-5}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(PROCESSOR_FILE), 'exec'), namespace)
-    return namespace['prepare_ncrystal_vdos']
-
-PREPARE = _helper()
 
 class Spectrum:
     def __init__(self, x, y, starts_zero):
@@ -46,7 +32,7 @@ def synthetic_tail(energy, density):
 def test_original_reference_grid_is_unchanged():
     energy,density = reference()
     x,y = synthetic_tail(energy,density)
-    new_x,new_y = PREPARE(Spectrum(x,y,False))
+    new_x,new_y = prepare_ncrystal_vdos(Spectrum(x,y,False))
     assert np.array_equal(new_x,energy)
     assert np.array_equal(new_y,density)
     assert len(new_x)==230
@@ -58,7 +44,7 @@ def test_ensemble_reconstructed_zero_flag_has_dense_original_tail():
     x,y = synthetic_tail(energy,density)
     # Sampling preserves E=0, so PhononSpectra reports starts_at_zero=True.
     # It can also change density and coordinates on the physically retained part.
-    new_x,new_y = PREPARE(Spectrum(x,y,True))
+    new_x,new_y = prepare_ncrystal_vdos(Spectrum(x,y,True))
     assert np.array_equal(new_x,energy)
     assert np.array_equal(new_y,density)
 
@@ -70,7 +56,7 @@ def test_ensemble_sample_with_warped_energy_coordinates():
     warped = x + warp
     warped[0]=0
     density_modified = y * (1.0 + 0.03*np.cos(12*x))
-    result_x,result_y=PREPARE(Spectrum(warped,density_modified,True))
+    result_x,result_y=prepare_ncrystal_vdos(Spectrum(warped,density_modified,True))
     retained_x = warped[2001:]
     retained_y = density_modified[2001:]
     assert result_x.shape == retained_x.shape
@@ -85,7 +71,7 @@ def test_irregular_external_sample_is_regularized_without_tail():
     x,y = reference()
     jitter = 0.00005 * np.sin(np.linspace(0,np.pi,len(x)))
     x_irregular=x+jitter
-    out_x,out_y=PREPARE(Spectrum(x_irregular,y,True))
+    out_x,out_y=prepare_ncrystal_vdos(Spectrum(x_irregular,y,True))
     assert np.allclose(np.diff(out_x),np.diff(out_x)[0],rtol=1e-10)
     assert np.isclose(np.trapezoid(out_y,out_x),np.trapezoid(y,x_irregular),rtol=1e-12)
 
@@ -93,7 +79,7 @@ def test_irregular_external_sample_is_regularized_without_tail():
 def test_native_leapr_zero_start_regular_grid_does_not_get_stripped():
     energy=np.linspace(0.0, 0.4, 301)
     density=np.exp(-((energy-0.1)/0.1)**2)
-    out_x,out_y=PREPARE(Spectrum(energy,density,True))
+    out_x,out_y=prepare_ncrystal_vdos(Spectrum(energy,density,True))
     assert np.array_equal(out_x,energy[1:])
     assert np.array_equal(out_y,density[1:])
 
@@ -107,7 +93,7 @@ def test_malformed_input_is_rejected(problem):
     elif problem=='duplicate':energy[20]=energy[19]
     elif problem=='no_valid':energy[:]=np.linspace(0,1e-6,len(energy))
     with pytest.raises(ValueError):
-        PREPARE(Spectrum(energy,density,True))
+        prepare_ncrystal_vdos(Spectrum(energy,density,True))
 
 
 # Ncrystal liquid physics diagnostics

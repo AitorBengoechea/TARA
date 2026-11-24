@@ -24,7 +24,18 @@ from processing.backends.liquid_capture.data import LiquidAnalysisState, LiquidK
 
 
 def is_liquid_template(filename):
-    """Return whether an existing NCMAT contains custom liquid settings."""
+    """Return whether an existing NCMAT contains custom liquid settings.
+
+    Parameters
+    ----------
+    filename : str or pathlib.Path
+        Candidate NCMAT path.
+
+    Returns
+    -------
+    bool
+        True if the path is a file containing a custom Liquids section.
+    """
     path = Path(filename)
     return path.is_file() and '@CUSTOM_LIQUIDS' in path.read_text(encoding='utf-8')
 
@@ -56,6 +67,36 @@ class NCrystalLiquidAnalysisProcessor:
     def __init__(self, base_ncmat_file, temperature, *, capture_library=None,
                  temp_dir=None, active_species=None, vdoslux=3, timeout=600,
                  defer_capture=False):
+        """Initialize reference spectra and per-sample execution settings.
+
+
+        Parameters
+        ----------
+        base_ncmat_file : path-like
+            Source material, retained unchanged.
+        temperature : float
+            Requested physical temperature in kelvin.
+        capture_library : path-like, optional
+            Existing adapter built against NCrystal 4.4.6. If omitted, build
+            one in a temporary directory owned by this processor.
+        temp_dir : path-like, optional
+            Parent of unique per-call temporary directories.
+        active_species : collection of str, optional
+            Scattering-active labels, preserving original atomic fractions.
+        vdoslux : int, default=3
+            Native kernel resolution, from zero through five.
+        timeout : float, default=600
+            Maximum child execution time in seconds.
+        defer_capture : bool, optional
+            Defer adapter validation until a request needs captured kernels.
+
+        Raises
+        ------
+        ValueError
+            If the temperature, timeout, kernel resolution, or species settings are invalid.
+        """
+
+        # Record the native spacing before converting the source to Core spectra.
         self.source = load_liquid_ncmat(base_ncmat_file)
         template = NCrystalFile.from_file(str(base_ncmat_file))
         self.entries = parse_custom_liquids(self.source)
@@ -77,6 +118,7 @@ class NCrystalLiquidAnalysisProcessor:
         self.active_species = (None if active_species is None
                                else normalize_active_species(active_species))
 
+        # Workers borrow an adapter built and cleaned up by the parent.
         self._capture_build_dir = None
         self.capture_library = None
         self.identity = None
@@ -124,7 +166,18 @@ class NCrystalLiquidAnalysisProcessor:
         return state
 
     def _verify_adapter(self):
-        """Reject missing or changed adapter builds before starting samples."""
+        """Reject missing or changed adapter builds before starting samples.
+
+        Returns
+        -------
+        dict
+            Verified adapter and runtime identity from the build manifest.
+
+        Raises
+        ------
+        RuntimeError
+            If the ABI, runtime path, manifest schema, or recorded digests disagree.
+        """
         import NCrystal as NC
         metadata = json.loads(self.capture_library.with_suffix('.json').read_text())
         if metadata.get('schema') != 1:
@@ -207,6 +260,7 @@ class NCrystalLiquidAnalysisProcessor:
         material = self._apply_translation(dynamics, target)
         spectrum = dynamics.continuous
         reference = self.reference_spectra[target]
+
         # Retain the exact source VDOS for translation-only samples and the reference.
         if (np.array_equal(spectrum.energy_grid, reference.energy_grid)
                 and np.array_equal(spectrum.density_values, reference.density_values)):
@@ -262,15 +316,12 @@ class NCrystalLiquidAnalysisProcessor:
                 raise ValueError(f'No custom-liquid source VDOS for {label!r}')
             sample_grid = np.asarray(current.energy_grid, dtype=float)
             sample_density = np.asarray(current.density_values, dtype=float)
-            # Use the source NCMAT spacing and extend the upper edge when a sample
-            # shifts spectral support.
             grid, density = resample_on_source_spacing(
                 self.reference_grids[label], sample_grid, sample_density)
             material = replace_vdos(material, label, grid, density)
             positive = sample_grid > 0
             before = displacement_moment(sample_grid[positive], sample_density[positive], self.temperature)
             after = displacement_moment(grid, density, self.temperature)
-            # Include the implicit quadratic tail in the serialized area diagnostic.
             representation[label] = {
                 'method': 'original source spacing with upper extension',
                 'source_points': len(self.reference_grids[label]), 'serialized_points': len(grid),
@@ -313,6 +364,7 @@ class NCrystalLiquidAnalysisProcessor:
         if not capture_kernel and self.active_species is None:
             return self._evaluate_native(sample_index, spectrum, material, target,
                                          representation, energies)
+
         # The capture path also supplies species-resolved scattering when requested.
         self.initialize_capture()
         return self._evaluate_captured(sample_index, spectrum, material, target,
@@ -397,29 +449,8 @@ class NCrystalLiquidAnalysisProcessor:
         """
         with tempfile.TemporaryDirectory(prefix=f'liquid_{sample_index}_', dir=self.temp_dir) as tmp:
             root = Path(tmp)
-            (root / 'material.ncmat').write_text(material, encoding='utf-8')
-            np.savetxt(root / 'energies.txt', energies, fmt='%.17g')
-            request = {'target': target, 'temperature': self.temperature,
-                       'vdoslux': self.vdoslux, 'library_path': self.identity.get('library_path'),
-                       'active_species': None if self.active_species is None else sorted(self.active_species)}
-            (root / 'request.json').write_text(json.dumps(request))
-            env = os.environ.copy()
-            env['NCRYSTAL_SAB_DUMP_DIR'] = str(root)
-            env['LD_PRELOAD'] = str(self.capture_library) + (':' + env['LD_PRELOAD'] if env.get('LD_PRELOAD') else '')
-            source_root = str(Path(__file__).resolve().parents[2])
-            env['PYTHONPATH'] = source_root + os.pathsep + env.get('PYTHONPATH', '')
-            command = [sys.executable, '-m', 'processing.backends.liquid_capture.child', str(root / 'request.json')]
-            with (root / 'process.log').open('w') as log:
-                try:
-                    result = subprocess.run(command, env=env, stdout=log, stderr=log,
-                                            timeout=self.timeout, check=False)
-                except subprocess.TimeoutExpired as exc:
-                    raise RuntimeError(f'Liquid capture timed out for sample {sample_index}') from exc
-            if result.returncode:
-                with (root / 'process.log').open('rb') as log:
-                    log.seek(max(0, (root / 'process.log').stat().st_size - 6000))
-                    detail = log.read().decode(errors='replace')
-                raise RuntimeError(f'Liquid capture failed for sample {sample_index}:\n{detail}')
+            self._stage_capture_inputs(root, material, energies, target)
+            self._run_capture_child(root, sample_index)
             metadata = json.loads((root / 'result.json').read_text())
             with np.load(root / 'result.npz', allow_pickle=False) as archive:
                 arrays = {key: archive[key].copy() for key in archive.files}
@@ -441,3 +472,54 @@ class NCrystalLiquidAnalysisProcessor:
             xs_energy=arrays['xs_energy'], xs_scattering=arrays['xs_scattering'],
             xs_absorption=arrays['xs_absorption'], vdos_analysis=metadata['vdos_analysis'],
             provenance=metadata['provenance'])
+
+
+    def _stage_capture_inputs(self, root, material, energies, target):
+        """Write the per-sample NCMAT, energy grid, and capture request.
+
+        Parameters
+        ----------
+        root : pathlib.Path
+            Sample sandbox.
+        material : str
+            Prepared NCMAT content.
+        energies : numpy.ndarray
+            Incident energies in eV.
+        target : str
+            Liquid species whose kernel is used for analysis.
+        """
+        (root / 'material.ncmat').write_text(material, encoding='utf-8')
+        np.savetxt(root / 'energies.txt', energies, fmt='%.17g')
+        request = {'target': target, 'temperature': self.temperature,
+                   'vdoslux': self.vdoslux, 'library_path': self.identity.get('library_path'),
+                   'active_species': None if self.active_species is None else sorted(self.active_species)}
+        (root / 'request.json').write_text(json.dumps(request))
+
+    def _run_capture_child(self, root, sample_index):
+        """Run the adapter in an isolated Python process and report capture failures.
+
+        Parameters
+        ----------
+        root : pathlib.Path
+            Sample sandbox containing the staged request.
+        sample_index : int
+            Sample identifier used in failure messages.
+        """
+        # Preload the adapter only for the child; the parent stays unmodified.
+        env = os.environ.copy()
+        env['NCRYSTAL_SAB_DUMP_DIR'] = str(root)
+        env['LD_PRELOAD'] = str(self.capture_library) + (':' + env['LD_PRELOAD'] if env.get('LD_PRELOAD') else '')
+        source_root = str(Path(__file__).resolve().parents[2])
+        env['PYTHONPATH'] = source_root + os.pathsep + env.get('PYTHONPATH', '')
+        command = [sys.executable, '-m', 'processing.backends.liquid_capture.child', str(root / 'request.json')]
+        with (root / 'process.log').open('w') as log:
+            try:
+                result = subprocess.run(command, env=env, stdout=log, stderr=log,
+                                        timeout=self.timeout, check=False)
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(f'Liquid capture timed out for sample {sample_index}') from exc
+        if result.returncode:
+            with (root / 'process.log').open('rb') as log:
+                log.seek(max(0, (root / 'process.log').stat().st_size - 6000))
+                detail = log.read().decode(errors='replace')
+            raise RuntimeError(f'Liquid capture failed for sample {sample_index}:\n{detail}')

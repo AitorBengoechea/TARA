@@ -96,57 +96,55 @@ def build_ace_deck(
     del base_endf_path, tsl_endf_path
     effective_mte = _resolve_elastic_mt(mti, elas_mat, mte)
 
-    return "".join(
-        (
-            build_moder_module(70, -75),
-            build_moder_module(20, -25),
-            build_reconr_module(
-                -25,
-                -21,
-                label=f"Dynamically generated {base_za} at {temp}K",
-                # Use the shared free-format card writer while preserving this card’s terminator
-                # policy.
-                material_card=format_njoy_card(base_mat, 0, 0, terminated=False).strip(),
-            ),
-            build_broadr_module(
-                -25,
-                -21,
-                -22,
-                # Use the shared free-format card writer while preserving this card’s terminator
-                # policy.
-                material_card=format_njoy_card(base_mat, 1, 0, 0, 0, terminated=False).strip(),
-                temperature_card=f"{temp}",
-            ),
-            build_thermr_module(
-                -75,
-                -22,
-                -23,
-                control_card=(
-                    f"{tsl_mat} {base_mat} {nbin} 1 2 {icoh} "
-                    f"0 {natom} {mti} 2 /"
-                ),
-                temperature_card=f"{temp}",
-                # Use the shared free-format card writer while preserving this card’s terminator
-                # policy.
-                tolerance_card=format_njoy_card(tol, emax, terminated=False).strip(),
-            ),
-            build_acer_module(
-                -25,
-                -23,
-                0,
-                40,
-                41,
-                option_card=f"2 0 1 {suffix} /",
-                title_card=f"{base_za} TSL at {temp}K",
-                material_card=f"{base_mat} {temp} tsl /",
-                za_card=f"{za1} {za2} {za3} /",
-                thermal_card=(
-                    f"{mti} {ACER_THERMAL_NBINT} {effective_mte} {ielas} 1 {emax} 2 /"
-                ),
-            ),
-            build_stop_card(),
-        )
+    reconstruction = build_reconr_module(
+        -25,
+        -21,
+        label=f"Dynamically generated {base_za} at {temp}K",
+        material_card=format_njoy_card(base_mat, 0, 0, terminated=False).strip(),
     )
+    broadening = build_broadr_module(
+        -25,
+        -21,
+        -22,
+        material_card=format_njoy_card(base_mat, 1, 0, 0, 0, terminated=False).strip(),
+        temperature_card=f"{temp}",
+    )
+    thermal_scattering = build_thermr_module(
+        -75,
+        -22,
+        -23,
+        control_card=(
+            f"{tsl_mat} {base_mat} {nbin} 1 2 {icoh} "
+            f"0 {natom} {mti} 2 /"
+        ),
+        temperature_card=f"{temp}",
+        tolerance_card=format_njoy_card(tol, emax, terminated=False).strip(),
+    )
+    ace_conversion = build_acer_module(
+        -25,
+        -23,
+        0,
+        40,
+        41,
+        option_card=f"2 0 1 {suffix} /",
+        title_card=f"{base_za} TSL at {temp}K",
+        material_card=f"{base_mat} {temp} tsl /",
+        za_card=f"{za1} {za2} {za3} /",
+        thermal_card=(
+            f"{mti} {ACER_THERMAL_NBINT} {effective_mte} {ielas} 1 {emax} 2 /"
+        ),
+    )
+
+    # Thermal scattering acts on the broadened PENDF before ACER writes tapes 40 and 41.
+    return "".join((
+        build_moder_module(70, -75),
+        build_moder_module(20, -25),
+        reconstruction,
+        broadening,
+        thermal_scattering,
+        ace_conversion,
+        build_stop_card(),
+    ))
 
 
 def _resolve_elastic_mt(mti: int, elas_mat: int, mte: int | None) -> int:

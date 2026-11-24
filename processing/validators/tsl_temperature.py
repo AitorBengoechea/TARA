@@ -203,8 +203,7 @@ def _read_first_beta_temperatures(records: Iterator[str], path: Path) -> tuple[f
     beta_ranges, beta_count = int(_field(beta_header, 4)), int(_field(beta_header, 5))
     if beta_count < 1:
         raise ValueError(f"MF7/MT4 has no tabulated beta values in {path}.")
-    # Each TAB2 interpolation range contributes a pair of integers before the first beta
-    # block.
+    # Each TAB2 interpolation range contributes two fields before the first beta table.
     _skip_values(records, 2 * beta_ranges, path)
     first_beta = _next_record(records, path)  # TAB1 T0 and LT.
     t0, extra_count = _field(first_beta, 0), int(_field(first_beta, 2))
@@ -212,18 +211,41 @@ def _read_first_beta_temperatures(records: Iterator[str], path: Path) -> tuple[f
         raise ValueError(f"Invalid MF7/MT4 LT={extra_count} in {path}.")
     temperatures = [t0]
     if extra_count:
-        alpha_ranges = int(_field(first_beta, 4))
-        alpha_count = int(_field(first_beta, 5))
-        # Skip the first temperature's interpolation pairs and alpha/value pairs before
-        # reading the extra temperatures.
-        _skip_values(records, 2 * (alpha_ranges + alpha_count), path)
-        for _ in range(extra_count):
-            extra = _next_record(records, path)
-            temperatures.append(_field(extra, 0))
-            _skip_values(records, int(_field(extra, 4)), path)
+        temperatures.extend(_read_extra_beta_temperatures(records, path, first_beta, extra_count))
     if not all(math.isfinite(t) and t > 0.0 for t in temperatures):
         raise ValueError(f"Invalid MF7/MT4 temperature values in {path}: {temperatures}.")
     return tuple(sorted(set(temperatures)))
+
+
+def _read_extra_beta_temperatures(records, path, first_beta, extra_count):
+    """Read the additional temperature LIST records from the first beta table.
+
+    Parameters
+    ----------
+    records : iterator of str
+        MF7/MT4 record stream after the first TAB1 header.
+    path : pathlib.Path
+        Source file for diagnostics.
+    first_beta : str
+        TAB1 header giving the interpolation and alpha counts.
+    extra_count : int
+        Number of additional temperature records declared by LT.
+
+    Returns
+    -------
+    list of float
+        Additional physical temperatures in kelvin, in file order.
+    """
+    temperatures = []
+    alpha_ranges = int(_field(first_beta, 4))
+    alpha_count = int(_field(first_beta, 5))
+    # Each TAB1 interpolation pair and each alpha/value pair occupy two fields.
+    _skip_values(records, 2 * (alpha_ranges + alpha_count), path)
+    for _ in range(extra_count):
+        extra = _next_record(records, path)
+        temperatures.append(_field(extra, 0))
+        _skip_values(records, int(_field(extra, 4)), path)
+    return temperatures
 
 
 def validate_tsl_temperature(

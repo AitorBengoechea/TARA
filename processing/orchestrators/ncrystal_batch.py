@@ -82,7 +82,6 @@ class NcrystalBatchOrchestrator:
         include_reference : bool, optional
             Schedule the unperturbed reference as ``sample_000``. Defaults to
             True. When False, stochastic numbering still starts at one.
-
         liquid_options : dict, optional
             Optional liquid export overrides. TARA normally builds the capture
             adapter in a temporary directory and infers ``natom`` from NCMAT.
@@ -132,6 +131,23 @@ class NcrystalBatchOrchestrator:
             n_jobs=self.n_jobs,
         )
 
+        self._raise_invalid_solid_batch(results, ensemble, include_reference)
+
+        return {sid: path for sid, path, _ in results}
+
+    @staticmethod
+    def _raise_invalid_solid_batch(results, ensemble, include_reference):
+        """Report the count and identities of failed solid ENDF jobs.
+
+        Parameters
+        ----------
+        results : sequence of tuple
+            Sample identifiers, output paths, and failure messages.
+        ensemble : SpectraEnsemble
+            Original ensemble used to determine the expected sample count.
+        include_reference : bool
+            Whether the reference was scheduled.
+        """
         failures = [(sid, error) for sid, path, error in results if path is None]
         if failures:
             details = "; ".join(f"{sid}: {error}" for sid, error in failures[:10])
@@ -143,8 +159,6 @@ class NcrystalBatchOrchestrator:
                 f"NCrystal batch failed for {len(failures)} of {n_expected} "
                 f"spectra: {details}"
             )
-
-        return {sid: path for sid, path, _ in results}
 
     def _generate_liquid_ensemble_sab_tapes(
         self,
@@ -192,13 +206,7 @@ class NcrystalBatchOrchestrator:
 
         from processing.backends.liquid_capture.build import build_capture_library
 
-        options = dict(liquid_options)
-        allowed = {"capture_library", "epsilon_e_over_kt", "emax_eV",
-                   "effective_temperature_K", "natom", "vdoslux", "timeout", "force"}
-        if options.keys() - allowed:
-            raise ValueError(f"Unknown liquid options: {sorted(options.keys() - allowed)}")
-        if "natom" not in options:
-            options["natom"] = self._liquid_principal_atom_count(base_ncmat_file, atom_label)
+        options = self._prepare_liquid_options(liquid_options, base_ncmat_file, atom_label)
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         base_calls = self._template_generation_calls(
@@ -211,23 +219,64 @@ class NcrystalBatchOrchestrator:
             include_reference=include_reference,
         )
 
-        def _liquid_calls():
-            for args, kwargs in base_calls:
-                kwargs.pop("elastic_mode", None)
-                kwargs.update(options)
-                yield args, kwargs
-
         if options.get("capture_library") is not None:
-            results = run_parallel(generate_liquid_tape, _liquid_calls(), n_jobs=self.n_jobs)
+            results = run_parallel(generate_liquid_tape, self._liquid_capture_calls(base_calls, options), n_jobs=self.n_jobs)
         else:
             with tempfile.TemporaryDirectory(prefix="tara_liquid_capture_") as build_dir:
                 options["capture_library"] = str(build_capture_library(build_dir))
-                results = run_parallel(generate_liquid_tape, _liquid_calls(), n_jobs=self.n_jobs)
+                results = run_parallel(generate_liquid_tape, self._liquid_capture_calls(base_calls, options), n_jobs=self.n_jobs)
         failures = [(sid, error) for sid, path, error in results if path is None]
         if failures:
             raise RuntimeError(f"Liquid MF7 generation failed: {failures}")
         return {sid: path for sid, path, _ in results}
 
+
+    @staticmethod
+    def _liquid_capture_calls(base_calls, options):
+        """Apply liquid capture options to each template job.
+
+        Parameters
+        ----------
+        base_calls : iterable of tuple
+            Positional and keyword arguments for template jobs.
+        options : dict
+            Shared options for liquid kernel capture and export.
+
+        Yields
+        ------
+        tuple
+            Positional arguments and the updated liquid export keywords.
+        """
+        for args, kwargs in base_calls:
+            kwargs.pop("elastic_mode", None)
+            kwargs.update(options)
+            yield args, kwargs
+
+    def _prepare_liquid_options(self, liquid_options, base_ncmat_file, atom_label):
+        """Validate caller options and infer the principal scatterer count if needed.
+
+        Parameters
+        ----------
+        liquid_options : dict
+            Optional overrides for capture and export.
+        base_ncmat_file : str
+            Liquid NCMAT template.
+        atom_label : str
+            Principal species label.
+
+        Returns
+        -------
+        dict
+            Job options containing a principal scatterer count.
+        """
+        options = dict(liquid_options)
+        allowed = {"capture_library", "epsilon_e_over_kt", "emax_eV",
+                   "effective_temperature_K", "natom", "vdoslux", "timeout", "force"}
+        if options.keys() - allowed:
+            raise ValueError(f"Unknown liquid options: {sorted(options.keys() - allowed)}")
+        if "natom" not in options:
+            options["natom"] = self._liquid_principal_atom_count(base_ncmat_file, atom_label)
+        return options
 
     @staticmethod
     def _liquid_principal_atom_count(base_ncmat_file: str, atom_label: str) -> int:

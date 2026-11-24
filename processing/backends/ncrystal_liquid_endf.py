@@ -62,7 +62,7 @@ class LiquidKernel:
     beta: np.ndarray
     sab_beta_alpha: np.ndarray
 
-    # Component metadata and supported energy range.
+    # Principal scatterer and capture limits.
     mass_amu: float
     bound_xs_barn: float
     temperature_K: float
@@ -504,56 +504,21 @@ def _verify_s_tables(
                 raise RuntimeError("Alpha interpolation changed")
 
 
-def _verify_written(
-    path: Path,
-    expected: Dict[str, Any],
-    *,
-    lat: int,
-    lasym: int,
-    epsilon_e_over_kt: float,
-    energy_limit: float,
-    kernel: LiquidKernel,
-    smin: float,
-    natom: int,
-) -> Dict[str, Any]:
-    """Read back the written ENDF file with ``endf-parserpy`` and check fidelity.
+def _verify_readback_grids(sec, ref, lasym):
+    """Verify the MF7 table dimensions, beta coordinates, and symmetry.
 
     Parameters
     ----------
-    path : pathlib.Path
-        Written ENDF file path.
-    expected : dict of str to Any
-        Internal dictionary passed to ``EndfFile.write``.
-    lat : int
-        Expected ``LAT`` temperature-scaling flag.
+    sec, ref : dict
+        Parsed MF7/MT4 section and expected NCrystal source.
     lasym : int
-        Expected ``LASYM`` symmetry flag.
-    epsilon_e_over_kt : float
-        Approved dimensionless ``B(2)`` threshold.
-    energy_limit : float
-        Approved upper energy limit ``B(4)`` in eV.
+        Expected MF7 symmetry flag.
 
     Returns
     -------
-    dict of str to Any
-        Summary of readback beta bounds and grid point counts.
-
-    Raises
-    ------
-    RuntimeError
-        If any parsed MF7/MT4 flag, header scalar, or table differs.
+    tuple
+        Parsed beta array and expected counts of beta and alpha points.
     """
-    import endf_parserpy
-
-    Parser = getattr(endf_parserpy, "EndfParserPy", None) or endf_parserpy.EndfParser
-    parsed = Parser(explain_missing_variable=True, cache_dir=False).parsefile(str(path))
-    sec = parsed[7][4]
-    ref = expected["7/4"]
-
-    for field, want in (("LAT", lat), ("LASYM", lasym), ("LLN", 0), ("NS", 0)):
-        if int(sec[field]) != int(want):
-            raise RuntimeError(f"ENDF readback {field} mismatch")
-
     expected_nbeta = int(ref["NB"])
     if len(ref["beta"]) != expected_nbeta or len(ref["S_table"]) != expected_nbeta:
         raise RuntimeError("NCrystal source dictionary has inconsistent beta counts")
@@ -583,6 +548,21 @@ def _verify_written(
     if lasym == 1 and not (b_actual.min() < 0 < b_actual.max()):
         raise RuntimeError("Signed-beta branch missing after ENDF serialization")
 
+    return b_actual, expected_nbeta, expected_nalpha
+
+
+def _verify_readback_metadata(sec, ref, epsilon_e_over_kt, energy_limit):
+    """Check the serialized scattering coefficients and material temperature.
+
+    Parameters
+    ----------
+    sec, ref : dict
+        Parsed MF7/MT4 section and expected NCrystal source.
+    epsilon_e_over_kt : float
+        Approved dimensionless B(2) threshold.
+    energy_limit : float
+        Approved B(4) upper energy in eV.
+    """
     if not math.isclose(float(sec["B"][2]), epsilon_e_over_kt, rel_tol=2e-4):
         raise RuntimeError("ENDF readback B(2) differs from approved threshold")
     if not math.isclose(float(sec["B"][4]), energy_limit, rel_tol=2e-4):
@@ -595,6 +575,65 @@ def _verify_written(
     if not math.isclose(float(sec["T0"]), float(ref["T0"]), rel_tol=2e-4):
         raise RuntimeError("ENDF readback material temperature differs")
 
+
+def _verify_written(
+    path: Path,
+    expected: Dict[str, Any],
+    *,
+    lat: int,
+    lasym: int,
+    epsilon_e_over_kt: float,
+    energy_limit: float,
+    kernel: LiquidKernel,
+    smin: float,
+    natom: int,
+) -> Dict[str, Any]:
+    """Read back the written ENDF file with ``endf-parserpy`` and check fidelity.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Written ENDF file path.
+    expected : dict of str to Any
+        Internal dictionary passed to ``EndfFile.write``.
+    lat : int
+        Expected ``LAT`` temperature-scaling flag.
+    lasym : int
+        Expected ``LASYM`` symmetry flag.
+    epsilon_e_over_kt : float
+        Approved dimensionless ``B(2)`` threshold.
+    energy_limit : float
+        Approved upper energy limit ``B(4)`` in eV.
+    kernel : LiquidKernel
+        Validated original capture.
+    smin : float
+        S(alpha, beta) threshold used during export.
+    natom : int
+        Principal scatterer multiplicity.
+
+    Returns
+    -------
+    dict of str to Any
+        Summary of readback beta bounds and grid point counts.
+
+    Raises
+    ------
+    RuntimeError
+        If any parsed MF7/MT4 flag, header scalar, or table differs.
+    """
+    import endf_parserpy
+
+    Parser = getattr(endf_parserpy, "EndfParserPy", None) or endf_parserpy.EndfParser
+    parsed = Parser(explain_missing_variable=True, cache_dir=False).parsefile(str(path))
+    sec = parsed[7][4]
+    ref = expected["7/4"]
+
+    for field, want in (("LAT", lat), ("LASYM", lasym), ("LLN", 0), ("NS", 0)):
+        if int(sec[field]) != int(want):
+            raise RuntimeError(f"ENDF readback {field} mismatch")
+
+    b_actual, expected_nbeta, expected_nalpha = _verify_readback_grids(sec, ref, lasym)
+    _verify_readback_metadata(sec, ref, epsilon_e_over_kt, energy_limit)
     for key in ('NBT', 'INT'):
         if sec['beta_interp'][key] != ref['beta_interp/' + key]:
             raise RuntimeError('Beta interpolation changed on readback')
@@ -632,10 +671,36 @@ def _validate_export_arguments(
 ) -> Tuple[float, float, float]:
     """Validate all physical and administrative parameters before ENDF export.
 
+    Parameters
+    ----------
+    k : LiquidKernel
+        Validated kernel and its maximum supported incident energy.
+    capture_index, expected_capture_count : int
+        Capture index and required number of identified captures.
+    element : str
+        Selected element label.
+    lasym, mat, natom : int
+        MF7 symmetry flag, ENDF material identifier, and principal atom count.
+    teff_evidence : str
+        Effective-temperature provenance.
+    effective_temperature_K : float
+        Effective temperature in kelvin.
+    epsilon_e_over_kt : float
+        Dimensionless B(2) threshold.
+    emax_eV, downstream_emax_eV : float
+        Export and downstream processing energy limits in eV.
+    smin : float
+        Minimum retained scattering-law value.
+
     Returns
     -------
     teff, eps, emax : tuple of float
         Validated effective temperature (K), dimensionless B(2), and Emax (eV).
+
+    Raises
+    ------
+    ValueError
+        If an argument violates the physical or ENDF export constraints.
     """
     if type(capture_index) is not int or capture_index < 0:
         raise ValueError("capture_index must be a nonnegative integer")
@@ -666,6 +731,193 @@ def _validate_export_arguments(
     if smin < 0 or not math.isfinite(smin):
         raise ValueError("smin must be nonnegative and finite")
     return teff, eps, emax
+
+
+def _prepare_export_paths(source_ncmat_path, output_path, force):
+    """Validate the NCMAT source and protect the requested destination.
+
+    Parameters
+    ----------
+    source_ncmat_path, output_path : str or pathlib.Path
+        Source Liquids NCMAT and target ENDF file.
+    force : bool
+        Permit replacing an existing destination.
+
+    Returns
+    -------
+    tuple
+        Resolved source, its SHA-256 hash, and the resolved destination.
+    """
+    source = Path(source_ncmat_path).expanduser().resolve()
+    if not source.is_file() or "@CUSTOM_LIQUIDS" not in source.read_text(encoding="utf-8"):
+        raise ValueError("Source must be an existing Liquids-plugin NCMAT")
+    source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    target = Path(output_path).expanduser().resolve()
+    if target.exists() and not force:
+        raise FileExistsError(
+            f"Output exists; pass force=True only if intended: {target}"
+        )
+
+    return source, source_sha256, target
+
+
+def _verified_source_atom(ncrystal, source, element, kernel):
+    """Check that source NCMAT species data agree with the capture.
+
+    Parameters
+    ----------
+    ncrystal : module
+        Imported NCrystal module.
+    source : pathlib.Path
+        Source NCMAT path.
+    element : str
+        Captured species label.
+    kernel : LiquidKernel
+        Normalized kernel including the temperature and atom data.
+
+    Returns
+    -------
+    object
+        Verified NCrystal atom data.
+    """
+    atom, matT = _find_element_atomdata(ncrystal, source, element, kernel.temperature_K)
+    _assert_close_scalar("Temperature", matT, kernel.temperature_K, rtol=1e-8)
+    _assert_close_scalar("Mass [amu]", atom.averageMassAMU(), kernel.mass_amu, rtol=3e-4)
+    _assert_close_scalar(
+        "Bound scattering XS [barn]", atom.scatteringXS(), kernel.bound_xs_barn, rtol=3e-4
+    )
+
+    return atom
+
+
+def _build_liquid_endf(
+    upstream, metadata_type, upstream_data, report, *, element, mat, lasym, smin, emax, eps, natom,
+):
+    """Construct the upstream writer and apply liquid MF7 metadata.
+
+    Parameters
+    ----------
+    upstream : module
+        NCrystal ENDF implementation.
+    metadata_type : type
+        NCrystal ENDF metadata class.
+    upstream_data : object
+        Kernel converted to the upstream exporter data structure.
+    report : dict
+        Signed-beta detailed-balance diagnostics.
+    element : str
+        Target species label.
+    mat, lasym, natom : int
+        ENDF material, symmetry flag, and principal scatterer count.
+    smin : float
+        Minimum S(alpha, beta) threshold.
+    emax, eps : float
+        Upper energy in eV and dimensionless B(2) threshold.
+
+    Returns
+    -------
+    object
+        Configured upstream EndfFile.
+    """
+    if lasym == 0:
+        upstream_data.comments.append("Symmetric MF7 derived from captured beta <= 0 branch.")
+        mismatch = report["p99_abs_log"]
+        if mismatch is not None:
+            upstream_data.comments.append(f"Signed capture balance log residual p99: {mismatch:.6g}")
+    metadata = metadata_type()
+    endf_obj = upstream.EndfFile(
+        element,
+        upstream_data,
+        mat,
+        metadata,
+        smin=float(smin),
+        emax=emax,
+        lasym=lasym,
+        include_gif=False,
+        isotopic_expansion=False,
+        verbosity=0,
+    )
+
+    # Patch B(2) explicitly (NCrystal 4.4.6 sets B(2)=B(4)=Emax) and B(6) for NATOM.
+    d = endf_obj._endf_dict
+    if int(d["7/4"]["LASYM"]) != lasym or not math.isclose(
+        float(d["7/4"]["B"][4]), emax, rel_tol=1e-12
+    ):
+        raise RuntimeError("Unexpected NCrystal MF7 internal dictionary contract")
+    d["7/4"]["B"][2] = eps
+    d["7/4"]["B"][6] = float(natom)
+    d["7/4"]["B"][1] *= natom
+    d["0/0"]["TAPEDESCR"] = "Liquid SABData via NCrystal 4.4.6 EndfFile"
+    d["1/451"]["DESCRIPTION"][1] = (
+        "EXPERIMENTAL NCrystal Liquids SABData adapter; NOT ACE VALIDATED".ljust(66)
+    )
+
+    return endf_obj
+
+
+def _publish_liquid_endf(
+    endf_obj, target, source, source_sha256, *, kernel, eps, emax, lasym, smin, natom, readback, force,
+):
+    """Stage, verify, and publish one ENDF file.
+
+    Parameters
+    ----------
+    endf_obj : object
+        NCrystal ENDF writer ready to serialize.
+    target, source : pathlib.Path
+        Resolved ENDF destination and NCMAT source.
+    source_sha256 : str
+        Source identity expected before publication.
+    kernel : LiquidKernel
+        Captured kernel used in readback.
+    eps, emax : float
+        Dimensionless B(2) and upper energy in eV.
+    lasym, natom : int
+        Symmetry flag and principal scatterer count.
+    smin : float
+        S(alpha, beta) threshold used by the writer.
+    readback, force : bool
+        Verify the staged file and allow replacing the destination, respectively.
+
+    Returns
+    -------
+    tuple
+        Output size in bytes, its SHA-256 hash, and readback metrics.
+    """
+    expected = endf_obj._endf_dict
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=".nc_endf_stage_", dir=target.parent
+    ) as td:
+        stage = Path(td) / target.name
+        endf_obj.write(stage.name, force=False, outdir=td)
+        if not stage.is_file() or stage.stat().st_size == 0:
+            raise RuntimeError("NCrystal writer did not produce an ENDF file")
+        verified = (
+            _verify_written(
+                stage,
+                expected,
+                lat=1,
+                lasym=lasym,
+                epsilon_e_over_kt=eps,
+                energy_limit=emax,
+                kernel=kernel, smin=smin, natom=natom,
+            )
+            if readback
+            else {"readback_skipped": True}
+        )
+        if hashlib.sha256(source.read_bytes()).hexdigest() != source_sha256:
+            raise RuntimeError("Source NCMAT changed during export")
+        output_bytes = stage.stat().st_size
+        output_sha256 = hashlib.sha256(stage.read_bytes()).hexdigest()
+        # Hard-link publication preserves the no-overwrite contract if the
+        # destination appears while the staged file is being verified.
+        if force:
+            os.replace(stage, target)
+        else:
+            os.link(stage, target)
+
+    return output_bytes, output_sha256, verified
 
 
 def write_liquid_with_ncrystal(
@@ -754,95 +1006,25 @@ def write_liquid_with_ncrystal(
         natom=natom,
     )
 
-    source = Path(source_ncmat_path).expanduser().resolve()
-    if not source.is_file() or "@CUSTOM_LIQUIDS" not in source.read_text(encoding="utf-8"):
-        raise ValueError("Source must be an existing Liquids-plugin NCMAT")
-    source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
-    target = Path(output_path).expanduser().resolve()
-    if target.exists() and not force:
-        raise FileExistsError(
-            f"Output exists; pass force=True only if intended: {target}"
-        )
-
-    NC, upstream, EndfMetaData, ncrystal_version = _import_upstream(version_prefix)
-    atom, matT = _find_element_atomdata(NC, source, element, k.temperature_K)
-    _assert_close_scalar("Temperature", matT, k.temperature_K, rtol=1e-8)
-    _assert_close_scalar("Mass [amu]", atom.averageMassAMU(), k.mass_amu, rtol=3e-4)
-    _assert_close_scalar(
-        "Bound scattering XS [barn]", atom.scatteringXS(), k.bound_xs_barn, rtol=3e-4
+    source, source_sha256, target = _prepare_export_paths(
+        source_ncmat_path, output_path, force,
     )
+    NC, upstream, EndfMetaData, ncrystal_version = _import_upstream(version_prefix)
+    atom = _verified_source_atom(NC, source, element, k)
 
     upstream_data = build_upstream_data(
-        k,
-        element=element,
-        atomdata=atom,
-        effective_temperature_K=teff,
-        ncmat_path=source,
-        source_sha256=source_sha256,
-        upstream=upstream,
+        k, element=element, atomdata=atom, effective_temperature_K=teff,
+        ncmat_path=source, source_sha256=source_sha256, upstream=upstream,
     )
     report = detailed_balance_report(k)
-    if lasym == 0:
-        upstream_data.comments.append("Symmetric MF7 derived from captured beta <= 0 branch.")
-        mismatch = report["p99_abs_log"]
-        if mismatch is not None:
-            upstream_data.comments.append(f"Signed capture balance log residual p99: {mismatch:.6g}")
-    endf_obj = upstream.EndfFile(
-        element,
-        upstream_data,
-        mat,
-        EndfMetaData(),
-        smin=float(smin),
-        emax=emax,
-        lasym=lasym,
-        include_gif=False,
-        isotopic_expansion=False,
-        verbosity=0,
+    endf_obj = _build_liquid_endf(
+        upstream, EndfMetaData, upstream_data, report, element=element,
+        mat=mat, lasym=lasym, smin=smin, emax=emax, eps=eps, natom=natom,
     )
-
-    # Patch B(2) explicitly (NCrystal 4.4.6 sets B(2)=B(4)=Emax) and B(6) for NATOM.
-    d = endf_obj._endf_dict
-    if int(d["7/4"]["LASYM"]) != lasym or not math.isclose(
-        float(d["7/4"]["B"][4]), emax, rel_tol=1e-12
-    ):
-        raise RuntimeError("Unexpected NCrystal MF7 internal dictionary contract")
-    d["7/4"]["B"][2] = eps
-    d["7/4"]["B"][6] = float(natom)
-    d["7/4"]["B"][1] *= natom
-    d["0/0"]["TAPEDESCR"] = "Liquid SABData via NCrystal 4.4.6 EndfFile"
-    d["1/451"]["DESCRIPTION"][1] = (
-        "EXPERIMENTAL NCrystal Liquids SABData adapter; NOT ACE VALIDATED".ljust(66)
+    output_bytes, output_sha256, verified = _publish_liquid_endf(
+        endf_obj, target, source, source_sha256, kernel=k, eps=eps,
+        emax=emax, lasym=lasym, smin=smin, natom=natom, readback=readback, force=force,
     )
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(
-        prefix=".nc_endf_stage_", dir=target.parent
-    ) as td:
-        stage = Path(td) / target.name
-        endf_obj.write(stage.name, force=False, outdir=td)
-        if not stage.is_file() or stage.stat().st_size == 0:
-            raise RuntimeError("NCrystal writer did not produce an ENDF file")
-        verified = (
-            _verify_written(
-                stage,
-                d,
-                lat=1,
-                lasym=lasym,
-                epsilon_e_over_kt=eps,
-                energy_limit=emax,
-                kernel=k, smin=smin, natom=natom,
-            )
-            if readback
-            else {"readback_skipped": True}
-        )
-        if hashlib.sha256(source.read_bytes()).hexdigest() != source_sha256:
-            raise RuntimeError("Source NCMAT changed during export")
-        output_bytes = stage.stat().st_size
-        output_sha256 = hashlib.sha256(stage.read_bytes()).hexdigest()
-        if force:
-            os.replace(stage, target)
-        else:
-            os.link(stage, target)
 
     return dict(
         output_file=str(target),
@@ -960,6 +1142,55 @@ def load_sabtap_json(path: str | Path) -> Dict[str, Any]:
     return out
 
 
+def _prepare_sample_export(state, atom_label, temperature, effective_temperature_K):
+    """Verify the capture's source identity and prepare its export values.
+
+    Parameters
+    ----------
+    state : LiquidAnalysisState
+        Captured sample with kernel, backend thermodynamics, and provenance.
+    atom_label : str
+        Target species label.
+    temperature : float
+        Physical material temperature in kelvin.
+    effective_temperature_K : float or None
+        User-supplied effective temperature, if provided.
+
+    Returns
+    -------
+    tuple
+        Generated NCMAT content, extractKnl-style dictionary, and effective temperature in kelvin.
+    """
+    from input_output.ncrystal.liquids import parse_custom_liquids
+
+    kernel = state.kernels[atom_label]
+    material = state.provenance["material_ncmat"]
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    if digest != state.provenance["material_sha256"]:
+        raise RuntimeError("Captured material identity does not match export")
+
+    settings = next(
+        x for x in parse_custom_liquids(material) if x.atom == atom_label
+    )
+    teff = effective_temperature_K
+    if teff is None:
+        teff = (
+            settings.ws * state.vdos_analysis["teff"]
+            + settings.wt * temperature
+        ) / (settings.ws + settings.wt)
+
+    data = dict(
+        alpha=kernel.alpha,
+        beta=kernel.beta,
+        sab=kernel.sab,
+        mass_amu=kernel.mass_amu,
+        scatxs=kernel.bound_xs,
+        temperature=kernel.temperature,
+        suggested_emax=kernel.suggested_emax,
+    )
+    return material, data, teff
+
+
 def generate_liquid_tape(
     *,
     sample_id: str,
@@ -1015,7 +1246,6 @@ def generate_liquid_tape(
         ``(sample_id, output_path, None)`` on success, or
         ``(sample_id, None, error_message)`` on failure.
     """
-    from input_output.ncrystal.liquids import parse_custom_liquids
     from processing.backends.ncrystal_liquid_analysis import (
         NCrystalLiquidAnalysisProcessor,
     )
@@ -1031,30 +1261,8 @@ def generate_liquid_tape(
         state = processor.create_analysis_state(
             sample_index, spectrum, atom_label, energy_grid=[0.0253]
         )
-        kernel = state.kernels[atom_label]
-        material = state.provenance["material_ncmat"]
-        digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
-        if digest != state.provenance["material_sha256"]:
-            raise RuntimeError("Captured material identity does not match export")
-
-        settings = next(
-            x for x in parse_custom_liquids(material) if x.atom == atom_label
-        )
-        teff = effective_temperature_K
-        if teff is None:
-            teff = (
-                settings.ws * state.vdos_analysis["teff"]
-                + settings.wt * temperature
-            ) / (settings.ws + settings.wt)
-
-        data = dict(
-            alpha=kernel.alpha,
-            beta=kernel.beta,
-            sab=kernel.sab,
-            mass_amu=kernel.mass_amu,
-            scatxs=kernel.bound_xs,
-            temperature=kernel.temperature,
-            suggested_emax=kernel.suggested_emax,
+        material, data, teff = _prepare_sample_export(
+            state, atom_label, temperature, effective_temperature_K,
         )
         with tempfile.TemporaryDirectory(prefix="liquid_mf7_") as temporary:
             source = Path(temporary) / "sample.ncmat"
