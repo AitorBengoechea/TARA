@@ -38,9 +38,13 @@ class LiquidKernel:
     ``fraction`` is the original atomic fraction, never applied to S.
     """
     label: str
+
+    # Scattering-law coordinates and values.
     alpha: np.ndarray
     beta: np.ndarray
     sab: np.ndarray
+
+    # Component metadata and supported energy range.
     mass_amu: float
     temperature: float
     bound_xs: float
@@ -100,15 +104,23 @@ class LiquidAnalysisState:
         Explicit target mass in atomic mass units. Defaults to the kernel
         mass when read. Default is None.
     """
+
+    # Target component and scattering kernels.
     target_lbl: str
     kernels: dict[str, LiquidKernel]
+
+    # Core and backend vibrational spectra.
     energy_grid: np.ndarray
     pdos: np.ndarray
     backend_energy_grid: np.ndarray
     backend_pdos: np.ndarray
+
+    # Cross-section grids and values.
     xs_energy: np.ndarray
     xs_scattering: np.ndarray
     xs_absorption: np.ndarray
+
+    # Derived quantities and capture metadata.
     vdos_analysis: dict[str, float]
     provenance: dict[str, Any]
     target_mass_amu: float | None = None

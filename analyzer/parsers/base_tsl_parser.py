@@ -30,7 +30,9 @@ class BaseTslParser(BaseParser, ABC):
         """
         if requested:
             return self._extract_thermodynamics(engine)
-        return ThermodynamicsData(**{field.name: np.nan for field in fields(ThermodynamicsData)})
+        return ThermodynamicsData(
+            **{field.name: np.nan for field in fields(ThermodynamicsData)}
+        )
 
     def _apply_universal_kinematics(
         self,
@@ -72,9 +74,7 @@ class BaseTslParser(BaseParser, ABC):
         if not any(flags.values()):
             return
 
-        ein_arr = np.atleast_1d(
-            kwargs.get("ein_arr", [0.0253])
-        ).astype(float)
+        ein_arr = np.atleast_1d(kwargs.get("ein_arr", [0.0253])).astype(float)
 
         dsf = Dsf(
             sab=canonical_sab,
@@ -192,8 +192,7 @@ class BaseTslParser(BaseParser, ABC):
             Tabulated values with the coordinates established by this operation.
         """
         rows = {
-            ein: getattr(result, attribute)
-            for ein, result in results.items()
+            ein: getattr(result, attribute) for ein, result in results.items()
         }
         frame = pd.DataFrame.from_dict(rows, orient="index")
         frame.index.name = "Ein"

@@ -50,11 +50,14 @@ class EnsembleGeneration:
         monte_carlo for compatibility with older manually assembled records.
     """
 
+    # Perturbation methods, bounds, and sample count.
     amplitude_method: str
     spatial_method: str
     max_energy_shift_mev: float
     max_amplitude_shift_pct: float
     n_samples: int
+
+    # Domain topology and coupling.
     grid_partition_method: str
     manual_energy_ranges: Optional[Tuple[Tuple[float, float], ...]]
     domain_splitting_strategy: str
@@ -63,6 +66,8 @@ class EnsembleGeneration:
     shared_grid_structure: bool
     freeze_origin: bool
     automatic_partition_prominence_pct: float = 1.0
+
+    # Random design.
     sampling_method: str = "monte_carlo"
 
 
@@ -85,6 +90,7 @@ class SampleGeneration:
         Actual spatial perturbation applied to each domain, in meV.
     """
 
+    # Energy domains and their perturbations.
     boundaries: Tuple[Tuple[float, float], ...]
     amplitude_shift_pct: Tuple[float, ...]
     energy_shift_mev: Tuple[float, ...]
@@ -121,9 +127,12 @@ class SamplingBlock:
         If indices, boundaries, or multiplier-array dimensions are invalid.
     """
 
+    # Sample range and energy domains.
     start_index: int
     end_index: int
     boundaries: np.ndarray
+
+    # Perturbation multipliers.
     spatial_multipliers: np.ndarray
     amplitude_multipliers: Optional[np.ndarray] = None
 
@@ -479,6 +488,8 @@ class SpectraEnsemble:
             Ensemble density matrix using samples as rows and energies as columns.
         """
         if self._pdos_cache is None:
+            # Expose the full shared grid in the table. Per-sample support is tracked
+            # separately by sample length.
             sample_index = pd.Index(range(self.n_samples), name="Sample_Index")
             self._pdos_cache = pd.DataFrame(
                 self._density_matrix,

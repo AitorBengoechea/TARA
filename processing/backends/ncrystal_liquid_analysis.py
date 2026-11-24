@@ -262,12 +262,15 @@ class NCrystalLiquidAnalysisProcessor:
                 raise ValueError(f'No custom-liquid source VDOS for {label!r}')
             sample_grid = np.asarray(current.energy_grid, dtype=float)
             sample_density = np.asarray(current.density_values, dtype=float)
+            # Use the source NCMAT spacing and extend the upper edge when a sample
+            # shifts spectral support.
             grid, density = resample_on_source_spacing(
                 self.reference_grids[label], sample_grid, sample_density)
             material = replace_vdos(material, label, grid, density)
             positive = sample_grid > 0
             before = displacement_moment(sample_grid[positive], sample_density[positive], self.temperature)
             after = displacement_moment(grid, density, self.temperature)
+            # Include the implicit quadratic tail in the serialized area diagnostic.
             representation[label] = {
                 'method': 'original source spacing with upper extension',
                 'source_points': len(self.reference_grids[label]), 'serialized_points': len(grid),

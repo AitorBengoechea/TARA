@@ -13,6 +13,7 @@ KB_EV = physical_constants["Boltzmann constant in eV/K"][0]
 # Dynamically calculate the MSD conversion factor: (hbar^2) / (amu * eV)
 # This yields m^2. We divide by (angstrom^2) to convert to physical Angstroms^2.
 HBAR2_AMU_EV_ANGSTROM2 = (hbar**2) / (m_u * eV * (angstrom**2))
+
 # ==============================================================================
 #  NUMBA KERNELS (Thermodynamics)
 # ==============================================================================

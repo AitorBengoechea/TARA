@@ -342,5 +342,7 @@ def reconstruct_vibrational_spectrum(
     density = _interpolate_weighted_continuum(
         grid, continuous_spectrum, weight
     )
+    # Sum the weighted continuum and oscillator contributions before normalizing their
+    # combined shape.
     total_weight = _deposit_oscillators(grid, density, modes, weight, sigma)
     return PhononSpectra(pd.Series(density / total_weight, index=grid)), total_weight

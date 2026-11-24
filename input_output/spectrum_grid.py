@@ -65,6 +65,8 @@ def resample_on_source_spacing(
         raise ValueError("Sampled spectrum does not cover the original low-energy bound.")
 
     excess = float(source[-1] - original[-1])
+    # Extend only the upper edge by whole source steps. The tolerance avoids adding a
+    # node for roundoff.
     n_extra = max(0, int(np.ceil((excess - 1e-12) / spacing)))
     if n_extra:
         extra_energy = original[-1] + spacing * np.arange(1, n_extra + 1)

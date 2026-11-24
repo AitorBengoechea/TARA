@@ -168,6 +168,8 @@ def select_leapr_temperature_block(
     source = None
     for block in leapr_file.temp_blocks:
         value = float(block['temp'])
+        # Negative Card 10 temperatures reuse the data from the preceding positive
+        # block.
         if value > 0.0:
             source = block
         if math.isclose(abs(value), requested, abs_tol=tolerance_k, rel_tol=0.0):

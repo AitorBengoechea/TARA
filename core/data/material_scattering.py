@@ -105,9 +105,12 @@ class SpeciesDynamics:
         Optional separate intramolecular vibrational modes.
     """
 
+    # Continuous spectrum and component weights.
     continuous: PhononSpectra
     continuous_weight: float = 1.0
     translation_weight: float = 0.0
+
+    # Translation model and fixed oscillator modes.
     translation_model: str = "none"
     oscillators: tuple[DiscreteOscillator, ...] = ()
     translation_parameter: float | None = None
@@ -181,9 +184,12 @@ class MaterialScatteringModel:
         Other material species represented by the input material model.
     """
 
+    # Material identity and conditions.
     identifier: str
     state: str
     temperature_k: float
+
+    # Scattering species and dynamics.
     principal: ScatteringSpecies
     dynamics: SpeciesDynamics
     secondary: tuple[ScatteringSpecies, ...] = ()

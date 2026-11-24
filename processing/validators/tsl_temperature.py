@@ -203,6 +203,8 @@ def _read_first_beta_temperatures(records: Iterator[str], path: Path) -> tuple[f
     beta_ranges, beta_count = int(_field(beta_header, 4)), int(_field(beta_header, 5))
     if beta_count < 1:
         raise ValueError(f"MF7/MT4 has no tabulated beta values in {path}.")
+    # Each TAB2 interpolation range contributes a pair of integers before the first beta
+    # block.
     _skip_values(records, 2 * beta_ranges, path)
     first_beta = _next_record(records, path)  # TAB1 T0 and LT.
     t0, extra_count = _field(first_beta, 0), int(_field(first_beta, 2))
@@ -212,6 +214,8 @@ def _read_first_beta_temperatures(records: Iterator[str], path: Path) -> tuple[f
     if extra_count:
         alpha_ranges = int(_field(first_beta, 4))
         alpha_count = int(_field(first_beta, 5))
+        # Skip the first temperature's interpolation pairs and alpha/value pairs before
+        # reading the extra temperatures.
         _skip_values(records, 2 * (alpha_ranges + alpha_count), path)
         for _ in range(extra_count):
             extra = _next_record(records, path)

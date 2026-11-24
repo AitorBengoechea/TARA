@@ -57,16 +57,23 @@ class NCrystalAnalysisState:
         Prepared scattering handles when component loading is requested.
     """
 
+    # Material source and loaded target.
     filepath: str
     target_lbl: str
     mat: Any
     nuc_data: Any
     mass_amu: float
+
+    # Core vibrational spectrum.
     energy_grid: np.ndarray
     pdos: np.ndarray
+
+    # Native scattering handles.
     scatter_inelastic: Optional[Any] = None
     scatter_coherent_elastic: Optional[Any] = None
     scatter_incoherent_elastic: Optional[Any] = None
+
+    # Backend vibrational spectrum.
     backend_energy_grid: Optional[np.ndarray] = None
     backend_pdos: Optional[np.ndarray] = None
 

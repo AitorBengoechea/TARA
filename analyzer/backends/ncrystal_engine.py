@@ -54,18 +54,24 @@ class NCrystalEngine:
     memory. The parser performs no I/O.
     """
 
+    # Material source and loaded target.
     filepath: str
     temperature: float
     target_lbl: str
     mat: Any
     nuc_data: Any
     mass_amu: float
+
+    # Core and backend vibrational spectra.
     energy_grid: np.ndarray
     pdos: np.ndarray
     backend_energy_grid: Optional[np.ndarray] = None
     backend_pdos: Optional[np.ndarray] = None
+
+    # Native scattering handles and liquid state.
     scatter_inelastic: Optional[Any] = None
     scatter_coherent_elastic: Optional[Any] = None
     scatter_incoherent_elastic: Optional[Any] = None
 
+    # Material state information
     liquid_data: Optional[Any] = None

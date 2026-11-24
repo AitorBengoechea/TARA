@@ -57,9 +57,12 @@ class LiquidKernel:
         Maximum supported incident neutron energy in electronvolts.
     """
 
+    # Scattering-law coordinates and values.
     alpha: np.ndarray
     beta: np.ndarray
     sab_beta_alpha: np.ndarray
+
+    # Component metadata and supported energy range.
     mass_amu: float
     bound_xs_barn: float
     temperature_K: float

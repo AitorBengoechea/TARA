@@ -229,6 +229,7 @@ class NjoyProcessor:
             Transient NJOY execution context.
         """
         run_id = uuid.uuid4().hex[:8]
+        # NJOY uses fixed tape names, so each execution needs its own working directory.
         run_dir = self.temp_dir / f"njoy_{run_id}"
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -246,6 +247,8 @@ class NjoyProcessor:
             stdout_text, _ = process.communicate(input=deck)
             stdout_text = stdout_text or ""
 
+            # Check the NJOY transcript as well as the exit status before exposing the
+            # tapes.
             if process.returncode != 0 or "error" in stdout_text.lower():
                 raise RuntimeError(
                     f"NJOY execution failed.\nOutput:\n{stdout_text}"
@@ -384,6 +387,7 @@ class NjoyProcessor:
         """
         leapr_mat = int(self._leapr_template.material_info["mat"])
         thermr_natom = int(self._leapr_template.principal_scatterer["npr"])
+        # Carry the template's elastic setting into the THERMR analysis deck.
         thermr_icoh = (
             1 if int(self._leapr_template.principal_scatterer.get("iel", 0)) != 0 else 0
         )

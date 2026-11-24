@@ -31,7 +31,10 @@ class MaterialEnsemble:
     sampling does not duplicate dense vibrational spectra.
     """
 
+    # Reference material.
     reference: MaterialScatteringModel
+
+    # Sampled translation and vibrational data.
     translation_weights: np.ndarray
     diffusion_parameters_c: np.ndarray
     spectra_ensemble: SpectraEnsemble | None = None
@@ -64,6 +67,8 @@ class MaterialEnsemble:
             raise IndexError("Material sample index out of range.")
         reference = self.reference.dynamics
         new_weight = float(self.translation_weights[index])
+        # Balance each translation-weight change against the continuum so the total
+        # component weight is conserved.
         dynamics = replace(
             reference,
             translation_weight=new_weight,
@@ -71,6 +76,8 @@ class MaterialEnsemble:
             continuous_weight=(reference.continuous_weight + reference.translation_weight - new_weight),
         )
         material = self.reference.with_dynamics(dynamics)
+        # Apply the matching sample shape after assigning its physical component
+        # weights.
         if self.spectra_ensemble is not None:
             material = material.with_spectrum(self.spectra_ensemble[index])
         return material

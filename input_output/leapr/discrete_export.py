@@ -97,6 +97,7 @@ def prepare_discrete_vibrational_block(source, spectrum, *, prepared=None):
     energy = spectrum.energy_grid
     if active.size and energy[-1] <= np.max(centers[active]):
         raise LeaprFormatError('Expected a full vibrational spectrum including discrete modes.')
+    # Preserve the original LEAPR cards when the spectrum represents the reference.
     if _is_reconstructed_reference(source, spectrum, prepared):
         return deepcopy(source)
 
@@ -111,6 +112,7 @@ def prepare_discrete_vibrational_block(source, spectrum, *, prepared=None):
     total_area = spectrum.integral
     recovered_weights = np.zeros_like(weights)
     recovered_centers = centers.copy()
+    # Recover each mode's weight from its area and its energy from its centroid.
     for mode, (area, moment, _) in zip(order, regions[1:]):
         if area <= 0:
             raise LeaprFormatError('A sampled LEAPR mode has no weight in its source region.')
@@ -119,6 +121,8 @@ def prepare_discrete_vibrational_block(source, spectrum, *, prepared=None):
 
     continuum = np.interp(native_grid, energy, spectrum.density_values, right=0.)
     continuum[native_grid > continuum_cut] = 0.
+    # LEAPR represents continuum shape and physical weight separately. Normalize the
+    # grid values separately from the component weights.
     native_area = np.trapezoid(continuum, native_grid)
     if continuum_area == 0:
         continuum = deepcopy(source['phonon_spectrum'])

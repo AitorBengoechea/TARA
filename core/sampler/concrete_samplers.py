@@ -1201,6 +1201,8 @@ class TaraSampler:
         spectra_ensemble = None
         if self._vibration_sampler is not None:
             spectra_ensemble = self._vibration_sampler.generate_ensemble(batch_size=batch_size)
+        # Reuse the vibrational sample indices and topology blocks when drawing
+        # diffusion parameters.
         if self._diffusion_sampler is not None:
             return self._diffusion_sampler.generate_ensemble(
                 self.config.n_samples, spectra_ensemble=spectra_ensemble,

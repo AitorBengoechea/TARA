@@ -31,13 +31,17 @@ class NjoyEngine:
         Captured NJOY output used for diagnostics and text extraction.
         Default is None.
     """
+
+    # Evaluation provenance and conditions.
     base_endf_file: str    # The original ENDF evaluation used for THERMR
     temperature: float
     mass_amu: float
+
+    # Vibrational spectrum.
     energy_grid: np.ndarray
     pdos: np.ndarray
     
-    # Parsed endf_parserpy objects
+    # Parsed tapes and execution diagnostics.
     leapr_tree: Any        # Contains S(a,b) data (MF=7)
     thermr_tree: Optional[Any] = None # Contains the integrated Cross Sections (MF=3)
     

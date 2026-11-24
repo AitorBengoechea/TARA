@@ -203,6 +203,7 @@ class UniversalAcePipeline:
         sab_tapes: Dict[str, str] = {}
         for path in tsl_paths:
             sample_id = path.stem
+            # Normalize the TSL suffix before checking identifiers for collisions.
             if sample_id.endswith("_sab"):
                 sample_id = sample_id[:-4]
             if not sample_id:

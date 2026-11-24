@@ -36,10 +36,14 @@ class VDOSRepresentationDiagnostics:
     NCrystal-valid scattering model. A large displacement-moment difference
     flags sensitivity and requires independent physical validation.
     """
+
+    # Baseline and regularized energy grids.
     original_min_ev: float
     original_step_ev: float
     regular_min_ev: float
     regular_step_ev: float
+
+    # Changes to the spectrum and displacement moment.
     shape_l1_change: float
     displacement_moment_relative_change: float
 

@@ -34,9 +34,12 @@ class PerturbationBatch:
     short lived.
     """
 
+    # Sample range and energy domains.
     start_index: int
     end_index: int
     boundaries: np.ndarray
+
+    # Perturbation multipliers.
     spatial_multipliers: np.ndarray
     amplitude_multipliers: Optional[np.ndarray] = None
 
@@ -103,6 +106,7 @@ class SpectrumBatch:
         zero padding.
     """
 
+    # Shared grid and batch storage.
     energy_grid: np.ndarray
     density: np.ndarray
     sample_lengths: np.ndarray

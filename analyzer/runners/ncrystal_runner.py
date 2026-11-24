@@ -113,9 +113,15 @@ class NCrystalRunner(BaseRunner):
         capture = runner_kwargs.get("capture_kernel", needs_kernel)
         if needs_kernel and not capture:
             raise ValueError("The requested liquid observables require kernel capture.")
+
+        # Initialize capture before worker launch when kernels or species-resolved
+        # scattering are needed.
         if capture or self.active_species is not None:
             self.processor.initialize_capture()
         options = {**runner_kwargs, "capture_kernel": capture}
+
+        # Liquid cross sections are evaluated during execution, so reuse the parser grid
+        # unless the runner supplies one.
         if "energy_grid" in parser_kwargs:
             options.setdefault("energy_grid", parser_kwargs["energy_grid"])
         return options
@@ -201,6 +207,7 @@ class _NCrystalVibrationRunner:
         NCrystalEngine
             Evaluated backend state.
         """
+        # Check if the material is liquid
         if self.is_liquid:
             options = {"atom_label": kwargs.get("atom_label"),
                        "energy_grid": kwargs.get("energy_grid")}
@@ -208,6 +215,7 @@ class _NCrystalVibrationRunner:
                 options["capture_kernel"] = kwargs["capture_kernel"]
             state = self.processor.create_analysis_state(sample_index, spectrum, **options)
             return _liquid_engine(state, self.temperature)
+
         # Ask Processing to prepare the transient material before constructing the in-memory
         # Analyzer state.
         state = self.processor.create_analysis_state(

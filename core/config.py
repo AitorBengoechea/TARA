@@ -62,12 +62,14 @@ class VibrationSamplingConfig:
     ----------
     vibration_enabled
     """
-    # 1. Mandatory User Parameters
+    # Perturbation bounds and sample count.
     max_energy_shift_mev: float
     max_amplitude_shift_pct: float
 
     # 2. Algorithmic Defaults
     n_samples: int = 0
+
+    # Energy domains and perturbation coupling.
     grid_partition_method: str = "automatic"
     manual_energy_ranges: Optional[List[Tuple[float, float]]] = None
     domain_splitting_strategy: str = "fixed"
@@ -77,6 +79,8 @@ class VibrationSamplingConfig:
     freeze_origin: bool = True
     fast_amplitude: bool = True
     automatic_partition_prominence_pct: float = 1.0
+
+    # Random design.
     sampling_method: str = "latin_hypercube"
     random_seed: int = 0
     
@@ -217,8 +221,11 @@ class DiffusionSamplingConfig:
     The bounds specify the ranges explored in a sensitivity study.
     """
 
+    # Translation sampling mode.
     enabled: bool = False
     mode: str = "diffusivity_only"
+
+    # Perturbation bounds and weight compensation.
     max_diffusivity_shift_pct: float = 0.0
     max_weight_shift_pct: float = 0.0
     weight_compensation: Optional[str] = None
@@ -320,8 +327,11 @@ class TaraConfig(VibrationSamplingConfig):
     vibrational bound above zero.
     """
 
+    # Vibrational perturbation bounds.
     max_energy_shift_mev: float = 0.0
     max_amplitude_shift_pct: float = 0.0
+
+    # Translation settings.
     diffusion: DiffusionSamplingConfig | Mapping[str, object] | None = field(
         default=None, kw_only=True,
     )

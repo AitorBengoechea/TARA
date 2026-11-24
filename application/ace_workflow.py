@@ -44,7 +44,25 @@ def _executable(name: str) -> Path:
 
 
 def _existing_input(path: Path, label: str) -> Path:
-    """Require a nonempty source material file before starting calculations."""
+    """Require a nonempty input file before starting a calculation.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Required input path.
+    label : str
+        Description used in error messages.
+
+    Returns
+    -------
+    pathlib.Path
+        Validated path.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the path is missing, empty, or is not a file.
+    """
     if not path.is_file() or path.stat().st_size == 0:
         raise FileNotFoundError(f"Missing or empty {label}: {path}")
     return path
@@ -68,14 +86,49 @@ def _prepare_ensemble(config: AceApplicationConfig, pdos: Any, *, material: Any 
         Reference and stochastic realizations for the active perturbations.
     """
     import numpy as np
-    from core.config import TaraConfig
     from core.data.input_pdos import PhononSpectra
     from core.sampler.concrete_samplers import TaraSampler
 
     sampling = config.section('sampling')
     ensemble = config.section('ensemble')
+    tara_config = _sampling_config(config, sampling, ensemble, material)
+    spectrum = None
+    if sampling['max_energy_shift_mev'] > 0 or sampling['max_amplitude_shift_pct'] > 0:
+        spectrum = PhononSpectra(pdos=pdos, auto_normalize=sampling['auto_normalize'])
+        # Legacy vibrational Monte Carlo consumes the global NumPy RNG.
+        if ensemble.get('sampling_method', 'latin_hypercube') == 'monte_carlo':
+            np.random.seed(ensemble['random_seed'])
+    sampler = TaraSampler(
+        config=tara_config, spectra=spectrum, material=material,
+        amplitude_method=sampling['amplitude_method'],
+        spatial_method=sampling['spatial_method'],
+    )
+    samples = sampler.generate_ensemble(batch_size=ensemble['batch_size'])
+    _validate_sample_ensemble(samples, ensemble)
+    return samples
+
+
+def _sampling_config(config: AceApplicationConfig, sampling: dict, ensemble: dict, material: Any):
+    """Map application sampling settings to the Core configuration.
+
+    Parameters
+    ----------
+    config : AceApplicationConfig
+        Validated workflow settings, including optional diffusion settings.
+    sampling, ensemble : dict
+        Vibrational settings and stochastic design settings, respectively.
+    material : MaterialScatteringModel or None
+        Physical reference when diffusion sampling is requested.
+
+    Returns
+    -------
+    TaraConfig
+        Core sampling configuration.
+    """
+    from core.config import TaraConfig
+
     diffusion = config.section('diffusion_sampling') if material is not None else None
-    tara_config = TaraConfig(
+    return TaraConfig(
         n_samples=ensemble['n_samples'],
         max_energy_shift_mev=sampling['max_energy_shift_mev'],
         max_amplitude_shift_pct=sampling['max_amplitude_shift_pct'],
@@ -92,25 +145,29 @@ def _prepare_ensemble(config: AceApplicationConfig, pdos: Any, *, material: Any 
         random_seed=ensemble['random_seed'],
         diffusion=diffusion,
     )
-    spectrum = None
-    if sampling['max_energy_shift_mev'] > 0 or sampling['max_amplitude_shift_pct'] > 0:
-        spectrum = PhononSpectra(pdos=pdos, auto_normalize=sampling['auto_normalize'])
-        # Legacy vibrational Monte Carlo consumes the global NumPy RNG.
-        if ensemble.get('sampling_method', 'latin_hypercube') == 'monte_carlo':
-            np.random.seed(ensemble['random_seed'])
-    sampler = TaraSampler(
-        config=tara_config, spectra=spectrum, material=material,
-        amplitude_method=sampling['amplitude_method'],
-        spatial_method=sampling['spatial_method'],
-    )
-    samples = sampler.generate_ensemble(batch_size=ensemble['batch_size'])
+
+
+def _validate_sample_ensemble(samples: Any, ensemble: dict) -> None:
+    """Verify the generated sample count and required reference.
+
+    Parameters
+    ----------
+    samples : SpectraEnsemble or MaterialEnsemble
+        Generated realizations.
+    ensemble : dict
+        Requested sample count and reference policy.
+
+    Raises
+    ------
+    RuntimeError
+        If the sample count differs or the required reference is missing.
+    """
     if ensemble['include_reference'] and samples.reference is None:
         raise RuntimeError('The generated ensemble is missing the sample_000 reference.')
     if len(samples) != ensemble['n_samples']:
         raise RuntimeError(
             f"Sample count mismatch: requested {ensemble['n_samples']}, got {len(samples)}."
         )
-    return samples
 
 
 def _ncrystal_tapes(
@@ -148,7 +205,27 @@ def _ncrystal_tapes(
 
 
 def _prepare_diffusion_ensemble(config: AceApplicationConfig, model: Any, pdos: Any):
-    """Prepare translation-only or joint realizations for a physical liquid."""
+    """Prepare translation-only or joint realizations for a liquid.
+
+    Parameters
+    ----------
+    config : AceApplicationConfig
+        Validated workflow settings.
+    model : MaterialScatteringModel
+        Physical liquid reference with translation dynamics.
+    pdos : pandas.Series
+        Reference vibrational spectrum.
+
+    Returns
+    -------
+    MaterialEnsemble
+        Reference and sampled liquid realizations.
+
+    Raises
+    ------
+    ValueError
+        If the physical reference is missing.
+    """
     if model is None:
         raise ValueError("Diffusion sampling requires a liquid physical model.")
     return _prepare_ensemble(config, pdos, material=model)
@@ -168,30 +245,17 @@ def _process_njoy(config: AceApplicationConfig, endf_dir: Path, njoy: Path):
 
     Returns
     -------
-    object
-        Generated ENDF path mapping and sampled ensemble.
+    tuple of dict and ensemble
+        Sample identifiers mapped to ENDF paths, followed by the sampled
+        spectra or material realizations.
     """
     from input_output.factory import load_file_object
     from processing.orchestrators.njoy_batch import NjoyBatchOrchestrator
 
     source = _existing_input(config.path('material', 'leapr_file'), 'LEAPR material')
     template, pdos = load_file_object(filepath=source)
-    if template is None:
-        raise TypeError(f'LEAPR source did not supply a material template: {source}')
     material = config.section('material')
-    physical_model = None
-    if material.get('state') == 'liquid':
-        # The original temperature block owns the liquid diffusion parameters.
-        from input_output.leapr.material_adapter import material_model_from_leapr
-        physical_model = material_model_from_leapr(
-            template, state='liquid', temperature=material['temperature_k'],
-        )
-        pdos = physical_model.dynamics.continuous.pdos
-    diffusion_options = config.sections.get('diffusion_sampling', {})
-    if diffusion_options.get('enabled', False):
-        samples = _prepare_diffusion_ensemble(config, physical_model, pdos)
-    else:
-        samples = _prepare_ensemble(config, pdos)
+    samples = _sample_leapr_material(config, source, material, template, pdos)
     execution = config.section('execution')
     # Preserve the original call signature for legacy solid configurations.
     state_options = {'material_state': material['state']} if 'state' in material else {}
@@ -206,6 +270,50 @@ def _process_njoy(config: AceApplicationConfig, endf_dir: Path, njoy: Path):
     return tapes, samples
 
 
+def _sample_leapr_material(
+    config: AceApplicationConfig, source: Path, material: dict, template: Any, pdos: Any,
+):
+    """Sample the LEAPR spectrum or the selected liquid material.
+
+    Parameters
+    ----------
+    config : AceApplicationConfig
+        Validated workflow and sampling settings.
+    source : pathlib.Path
+        LEAPR template path for diagnostics.
+    material : dict
+        Material state and requested temperature.
+    template : LeaprFile or None
+        Parsed material template.
+    pdos : pandas.Series
+        Spectrum loaded from the source file.
+
+    Returns
+    -------
+    SpectraEnsemble or MaterialEnsemble
+        Reference and sampled realizations.
+
+    Raises
+    ------
+    TypeError
+        If the loader did not return a LEAPR template.
+    """
+    if template is None:
+        raise TypeError(f'LEAPR source did not supply a material template: {source}')
+    physical_model = None
+    if material.get('state') == 'liquid':
+        # The original temperature block owns the liquid diffusion parameters.
+        from input_output.leapr.material_adapter import material_model_from_leapr
+        physical_model = material_model_from_leapr(
+            template, state='liquid', temperature=material['temperature_k'],
+        )
+        pdos = physical_model.dynamics.continuous.pdos
+    diffusion_options = config.sections.get('diffusion_sampling', {})
+    if diffusion_options.get('enabled', False):
+        return _prepare_diffusion_ensemble(config, physical_model, pdos)
+    return _prepare_ensemble(config, pdos)
+
+
 def _process_ncrystal(config: AceApplicationConfig, endf_dir: Path):
     """Load the NCrystal material and generate its MF7 evaluation ensemble.
 
@@ -218,29 +326,49 @@ def _process_ncrystal(config: AceApplicationConfig, endf_dir: Path):
 
     Returns
     -------
-    object
-        Generated ENDF path mapping and sampled ensemble.
+    tuple of dict and ensemble
+        Sample identifiers mapped to ENDF paths, followed by the sampled
+        spectra or material realizations.
     """
-    from input_output.ncrystal.core import NCrystalFile
-
     material = config.section('material')
-    atom_label = material['atom_label']
     if 'ncmat_file' in material:
         source = _existing_input(config.path('material', 'ncmat_file'), 'NCMAT material')
-        ncmat = NCrystalFile.from_file(str(source))
-        samples = _prepare_ensemble(config, ncmat.pdos_for_atom(atom_label))
-        return _ncrystal_tapes(config, samples, source, endf_dir), samples
+        return _process_ncmat_source(config, source, endf_dir)
 
     import NCrystal as NC
 
+    # Stage a built-in NCMAT as a file so it uses the same batch path as an external
+    # template.
     with tempfile.TemporaryDirectory(prefix='tara_ace_ncmat_') as folder:
         name = material['ncrystal_builtin']
         source = Path(folder) / Path(name).name
         source.write_text(NC.createTextData(name).rawData, encoding='utf-8')
-        ncmat = NCrystalFile.from_file(str(source))
-        samples = _prepare_ensemble(config, ncmat.pdos_for_atom(atom_label))
-        tapes = _ncrystal_tapes(config, samples, source, endf_dir)
-    return tapes, samples
+        return _process_ncmat_source(config, source, endf_dir)
+
+
+def _process_ncmat_source(config: AceApplicationConfig, source: Path, endf_dir: Path):
+    """Sample one NCMAT source and generate MF7 thermal-scattering tapes.
+
+    Parameters
+    ----------
+    config : AceApplicationConfig
+        Validated workflow specifying the target element and sampling settings.
+    source : pathlib.Path
+        Path to the available NCMAT template.
+    endf_dir : pathlib.Path
+        Destination for the ENDF tapes.
+
+    Returns
+    -------
+    tuple of dict and SpectraEnsemble
+        Sample identifiers mapped to ENDF paths, followed by the ensemble.
+    """
+    from input_output.ncrystal.core import NCrystalFile
+
+    atom_label = config.section('material')['atom_label']
+    ncmat = NCrystalFile.from_file(str(source))
+    samples = _prepare_ensemble(config, ncmat.pdos_for_atom(atom_label))
+    return _ncrystal_tapes(config, samples, source, endf_dir), samples
 
 
 def validate_ace_inputs(config: AceApplicationConfig) -> None:
@@ -266,8 +394,8 @@ def _expected_sample_ids(config: AceApplicationConfig, samples: Any) -> set[str]
     ----------
     config : AceApplicationConfig
         User-supplied workflow settings.
-    samples : SpectraEnsemble
-        Generated source spectra.
+    samples : SpectraEnsemble or MaterialEnsemble
+        Generated stochastic realizations with a separate reference.
 
     Returns
     -------
@@ -370,6 +498,8 @@ def _write_ace_provenance(
         Resolved NJOY executable.
     result : dict of str to str
         Validated ACE output paths.
+    samples : SpectraEnsemble, MaterialEnsemble, or None, optional
+        Ensemble supplying additional manifest provenance.
     """
     # Never save a successful-run manifest for an incomplete batch.
     output.mkdir(parents=True, exist_ok=True)
@@ -391,22 +521,40 @@ def _write_ace_provenance(
         'sample_ids': sorted(result),
         'settings': config.sections,
     }
-    if hasattr(samples, 'generation'):
-        manifest['sampling_topologies'] = [
-            {'start_index': b.start_index, 'end_index': b.end_index,
-             'n_domains': len(b.boundaries)} for b in samples.sampling_blocks
-        ]
-    if getattr(samples, 'spectra_ensemble', None) is not None:
-        manifest['sampling_topologies'] = [
-            {'start_index': b.start_index, 'end_index': b.end_index,
-             'n_domains': len(b.boundaries)}
-            for b in samples.spectra_ensemble.sampling_blocks
-        ]
-    if hasattr(samples, 'sample_info') and hasattr(samples, 'diffusion_parameters_c'):
-        manifest['diffusion_samples'] = samples.sample_info.reset_index().to_dict(orient='records')
+    manifest.update(_sampling_provenance(samples))
     (output / 'run_manifest.json').write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8'
     )
+
+
+def _sampling_provenance(samples: Any) -> dict[str, Any]:
+    """Collect available sampling diagnostics for the run manifest.
+
+    Parameters
+    ----------
+    samples : SpectraEnsemble, MaterialEnsemble, or None
+        Realizations associated with the completed batch, if supplied.
+
+    Returns
+    -------
+    dict
+        Available topology and diffusion records.
+    """
+    details = {}
+    spectra = getattr(samples, 'spectra_ensemble', None)
+    if spectra is None and hasattr(samples, 'generation'):
+        spectra = samples
+
+    # Joint runs keep vibrational topology in the nested ensemble.
+    if spectra is not None:
+        details['sampling_topologies'] = [
+            {'start_index': block.start_index, 'end_index': block.end_index,
+             'n_domains': len(block.boundaries)}
+            for block in spectra.sampling_blocks
+        ]
+    if hasattr(samples, 'sample_info') and hasattr(samples, 'diffusion_parameters_c'):
+        details['diffusion_samples'] = samples.sample_info.reset_index().to_dict(orient='records')
+    return details
 
 
 def run_ace_workflow(config: AceApplicationConfig) -> dict[str, str]:
@@ -429,9 +577,6 @@ def run_ace_workflow(config: AceApplicationConfig) -> dict[str, str]:
     RuntimeError
         The processing steps produced an incomplete or empty ACE batch.
     """
-    from processing.core.config import AceGenerationConfig
-    from processing.pipelines.ace_pipeline import UniversalAcePipeline
-
     material = config.section('material')
     validate_ace_inputs(config)
     base_endf = config.path('material', 'base_endf_file')
@@ -445,8 +590,49 @@ def run_ace_workflow(config: AceApplicationConfig) -> dict[str, str]:
     else:
         tapes, samples = _process_ncrystal(config, endf_dir)
 
+    # Check that every expected MF7 sample exists before passing the batch to ACE
+    # conversion.
     requested_ids = _expected_sample_ids(config, samples)
     _require_complete_batch(tapes, requested_ids, 'ENDF')
+    result = _convert_ace_batch(config, material, njoy, base_endf, output, tapes)
+    _require_complete_batch(result, requested_ids, 'ACE')
+    _validate_ace_artifacts(result, output, config.section('ace')['save_xsdir'])
+    if hasattr(samples, 'diffusion_parameters_c'):
+        _write_ace_provenance(config, output, material, njoy, result, samples=samples)
+    else:
+        _write_ace_provenance(config, output, material, njoy, result)
+    return result
+
+
+def _convert_ace_batch(
+    config: AceApplicationConfig, material: dict, njoy: Path, base_endf: Path,
+    output: Path, tapes: dict[str, str],
+) -> dict[str, str]:
+    """Convert the validated MF7 batch to ACE tables with NJOY.
+
+    Parameters
+    ----------
+    config : AceApplicationConfig
+        Validated workflow with ACE and execution options.
+    material : dict
+        Material state and scattering temperature.
+    njoy : pathlib.Path
+        Resolved NJOY executable.
+    base_endf : pathlib.Path
+        Base neutron ENDF evaluation used by the conversion.
+    output : pathlib.Path
+        Workflow output directory.
+    tapes : dict of str to str
+        Sample identifiers mapped to validated thermal-scattering ENDF paths.
+
+    Returns
+    -------
+    dict of str to str
+        Sample identifiers mapped to generated ACE paths.
+    """
+    from processing.core.config import AceGenerationConfig
+    from processing.pipelines.ace_pipeline import UniversalAcePipeline
+
     opts = config.section('ace')
     ace_options = AceGenerationConfig.from_endf(
         base_endf_path=str(base_endf), tsl_endf_files=tapes,
@@ -455,19 +641,12 @@ def run_ace_workflow(config: AceApplicationConfig) -> dict[str, str]:
         nbin=opts['nbin'], tol=opts['tolerance'],
         **_ace_reaction_overrides(material, opts),
     )
-    result = UniversalAcePipeline(
+    return UniversalAcePipeline(
         njoy_exec=str(njoy), n_jobs=config.section('execution')['n_jobs'],
     ).run(
         sab_tapes=tapes, output_dir=str(output / 'ace'),
         config=ace_options, save_xsdir=opts['save_xsdir'],
     )
-    _require_complete_batch(result, requested_ids, 'ACE')
-    _validate_ace_artifacts(result, output, opts['save_xsdir'])
-    if hasattr(samples, 'diffusion_parameters_c'):
-        _write_ace_provenance(config, output, material, njoy, result, samples=samples)
-    else:
-        _write_ace_provenance(config, output, material, njoy, result)
-    return result
 
 
 def run_ncrystal_native_ensemble(
@@ -480,9 +659,9 @@ def run_ncrystal_native_ensemble(
 ) -> dict[str, dict[str, str]]:
     """Execute an NCrystal native material ensemble using the same backend.
 
-    The NCMAT may represent any supported liquid model or composition;
-    composition, diffusion, coherent options and Young--Koppel state are
-    preserved verbatim. This is *not* an ACE production workflow.
+    The NCMAT may represent any supported liquid model or composition.
+    The native calculation retains composition, diffusion, coherent options,
+    and Young–Koppel state.
 
     Parameters
     ----------

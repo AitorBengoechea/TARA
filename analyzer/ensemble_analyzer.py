@@ -57,6 +57,8 @@ def _isolated_worker(
     PhysicsData
         Parsed physical evaluation for the requested sample.
     """
+    # Keep execution and parsing in the same worker so cleanup follows parsing even on
+    # failure.
     runner_output = None
     try:
         runner_output = runner.execute(index, spectrum, **runner_kwargs)
@@ -114,13 +116,16 @@ class EnsembleAnalyzer:
             Backend adapter used to evaluate one spectrum.
         parser : BaseParser
             Adapter that extracts physics results from an in-memory backend state.
-        sample_indices : Optional[Sequence[int]], optional
+        sample_indices : sequence of int or None, optional
             Original stochastic sample indices to include in the analysis.
 
         Raises
         ------
         TypeError
-            If the input or required state violates the operation contract.
+            If the ensemble is neither a SpectraEnsemble nor a MaterialEnsemble.
+        ValueError
+            If explicit sample indices are empty, repeated, out of range,
+            or have more than one dimension.
         """
         if not isinstance(ensemble, (SpectraEnsemble, MaterialEnsemble)):
             raise TypeError("ensemble must be a SpectraEnsemble instance or a MaterialEnsemble.")
@@ -160,7 +165,7 @@ class EnsembleAnalyzer:
         Raises
         ------
         ValueError
-            If indices are empty, duplicated, or outside the ensemble range.
+            If explicit indices are empty, repeated, out of range, or not one-dimensional.
         """
         if sample_indices is None:
             return np.arange(len(self.ensemble), dtype=np.int64)
@@ -200,12 +205,13 @@ class EnsembleAnalyzer:
 
         Notes
         -----
-        The reference spectrum never appears in ``raw_results`` or aggregated
-        stochastic DataFrames. This preserves one-to-one alignment between
-        analyzer ``Sample_Index`` values and the original ensemble indices.
+        This method updates `raw_results`, `reference_result`, and the
+        available aggregate attributes in place. Stochastic rows retain
+        their original ensemble indices. The reference is stored separately.
         """
         runner_kwargs = dict(runner_kwargs or {})
         parser_kwargs = parser_kwargs or {}
+        # Resolve backend requirements once before dispatching samples to workers.
         if isinstance(self.runner, BaseRunner):
             runner_kwargs = self.runner.prepare_analysis(runner_kwargs, parser_kwargs)
 
@@ -215,21 +221,36 @@ class EnsembleAnalyzer:
             parser_kwargs=parser_kwargs,
         )
 
-        # The baseline is a distinct physical reference, not stochastic sample 0.
         self.reference_result = None
-        if compute_reference and self.ensemble.reference is not None:
-            # Store the baseline result separately so it never occupies a stochastic sample
-            # index.
-            self.reference_result = _isolated_worker(
-                _REFERENCE_SAMPLE_INDEX,
-                self.ensemble.reference,
-                self.runner,
-                self.parser,
-                runner_kwargs,
-                parser_kwargs,
-            )
+        if compute_reference:
+            self.reference_result = self._compute_reference_result(runner_kwargs, parser_kwargs)
 
         self._aggregate_dataframes()
+
+    def _compute_reference_result(
+        self, runner_kwargs: Dict[str, Any], parser_kwargs: Dict[str, Any],
+    ) -> Optional[PhysicsData]:
+        """Evaluate the unperturbed reference through the prepared backend.
+
+        Parameters
+        ----------
+        runner_kwargs : dict
+            Prepared execution options for the backend runner.
+        parser_kwargs : dict
+            Observable options for the backend parser.
+
+        Returns
+        -------
+        PhysicsData or None
+            Reference evaluation, or None if the ensemble has no reference.
+        """
+        reference = self.ensemble.reference
+        if reference is None:
+            return None
+        return _isolated_worker(
+            _REFERENCE_SAMPLE_INDEX, reference, self.runner, self.parser,
+            runner_kwargs, parser_kwargs,
+        )
 
     @staticmethod
     def _prepare_series_for_alignment(series: pd.Series) -> pd.Series:
@@ -321,33 +342,43 @@ class EnsembleAnalyzer:
             for sample_index, series in series_by_sample
         ]
 
+        # Use the existing coordinate set with the most points as the target grid.
         canonical_series = max(
             (series for _, series in prepared_series),
             key=lambda series: series.size,
         )
         canonical_index = canonical_series.index.copy()
-        target_grid = canonical_index.to_numpy(dtype=np.float64, copy=False)
+        return EnsembleAnalyzer._stack_interpolated_series(prepared_series, canonical_index)
 
-        matrix = np.empty(
-            (len(prepared_series), target_grid.size),
-            dtype=np.float64,
-        )
-        sample_indices = []
+    @staticmethod
+    def _stack_interpolated_series(
+        series_by_sample: Sequence[tuple[int, pd.Series]], target_index: pd.Index,
+    ) -> pd.DataFrame:
+        """Interpolate cleaned series and stack them on the target grid.
 
-        for row_idx, (sample_index, series) in enumerate(prepared_series):
-            matrix[row_idx] = EnsembleAnalyzer._interpolate_clean_series(
-                series, target_grid,
-            )
+        Parameters
+        ----------
+        series_by_sample : sequence of tuple of int and pandas.Series
+            Original sample indices paired with cleaned coordinate series.
+        target_index : pandas.Index
+            Target coordinates in the order used for the output columns.
 
-            sample_indices.append(sample_index)
+        Returns
+        -------
+        pandas.DataFrame
+            Rows in input sample order, with zero outside each sample's
+            original coordinate support.
+        """
+        target_grid = target_index.to_numpy(dtype=np.float64, copy=False)
+        matrix = np.empty((len(series_by_sample), target_grid.size), dtype=np.float64)
+        for row, (_, series) in enumerate(series_by_sample):
+            matrix[row] = EnsembleAnalyzer._interpolate_clean_series(series, target_grid)
 
-        aligned = pd.DataFrame(
+        return pd.DataFrame(
             matrix,
-            index=sample_indices,
-            columns=canonical_index,
+            index=pd.Index([index for index, _ in series_by_sample], name="Sample_Index"),
+            columns=target_index,
         )
-        aligned.index.name = "Sample_Index"
-        return aligned
 
     @staticmethod
     def _interpolate_clean_series(series: pd.Series, target_grid: np.ndarray) -> np.ndarray:
@@ -388,15 +419,15 @@ class EnsembleAnalyzer:
         Parameters
         ----------
         parallel : bool
-            Whether to use the reserved, HPC-aware worker count.
-        runner_kwargs : dict[str, Any]
+            Use the worker count selected by the parallel executor when True.
+        runner_kwargs : dict
             Arguments for the backend runner.
-        parser_kwargs : dict[str, Any]
+        parser_kwargs : dict
             Arguments for the backend parser.
 
         Returns
         -------
-        list[PhysicsData]
+        list of PhysicsData
             Results ordered by the original sample selection.
         """
         return run_parallel(
@@ -410,7 +441,12 @@ class EnsembleAnalyzer:
         )
 
     def _aggregate_dataframes(self) -> None:
-        """Aggregate computed stochastic results into ensemble DataFrames.
+        """Build ensemble tables and per-energy mappings from stochastic results.
+
+        Notes
+        -----
+        Updates aggregate attributes from `raw_results`. An empty result
+        list leaves the existing attributes untouched.
         """
         if not self.raw_results:
             return
@@ -421,7 +457,12 @@ class EnsembleAnalyzer:
         self._aggregate_dataframe_multi_ein()
 
     def _aggregate_thermodynamics(self) -> None:
-        """Aggregate thermodynamic scalar values by stochastic sample index.
+        """Build the thermodynamics table from the current stochastic results.
+
+        Notes
+        -----
+        Sets `thermo_df` with one row per original sample index. A scope
+        is attached only when every result reports the same scope.
         """
         thermo_list = []
         for result in self.raw_results:
@@ -445,7 +486,12 @@ class EnsembleAnalyzer:
             self.thermo_df.attrs["scope"] = scopes.pop()
 
     def _aggregate_integral_1d(self) -> None:
-        """Aggregate one-dimensional integral outputs on their shared grids.
+        """Stack available cross sections and scattering ratios by sample index.
+
+        Notes
+        -----
+        Stores each available observable in its corresponding ``*_df``
+        attribute, using the incident-energy grid supplied by the parser.
         """
         integral_1d_attributes = [
             "xs_total",
@@ -459,107 +505,109 @@ class EnsembleAnalyzer:
         ]
 
         for attr in integral_1d_attributes:
-            available = [
-                result
-                for result in self.raw_results
-                if getattr(result.integ, attr) is not None
-            ]
-            if not available:
-                continue
+            series = self._integral_outputs(attr)
+            if series:
+                setattr(self, f"{attr}_df", self._stack_shared_grid(series))
 
-            shared_grid = getattr(available[0].integ, attr).index
-            matrix = np.array(
-                [getattr(result.integ, attr).values for result in available]
-            )
-            valid_indices = [result.sample_index for result in available]
+    def _integral_outputs(self, attribute: str) -> list[tuple[int, Any]]:
+        """Collect the available values of one integral observable.
 
-            df = pd.DataFrame(
-                matrix,
-                index=valid_indices,
-                columns=shared_grid,
-            )
-            df.index.name = "Sample_Index"
-            setattr(self, f"{attr}_df", df)
+        Parameters
+        ----------
+        attribute : str
+            Name of the field on each sample's integral result.
+
+        Returns
+        -------
+        list of tuple
+            Original sample indices paired with available values in result order.
+        """
+        outputs = []
+        for result in self.raw_results:
+            value = getattr(result.integ, attribute)
+            if value is not None:
+                outputs.append((result.sample_index, value))
+        return outputs
+
+    @staticmethod
+    def _stack_shared_grid(series: Sequence[tuple[int, pd.Series]]) -> pd.DataFrame:
+        """Stack one-dimensional outputs evaluated on a common grid.
+
+        Parameters
+        ----------
+        series : sequence of tuple
+            Nonempty sequence of sample indices paired with their Series.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Sample-indexed values on the first Series' coordinate grid.
+        """
+        indices, values = zip(*series)
+        # These observables already share a grid, so stack without interpolation.
+        return pd.DataFrame(
+            np.array([value.values for value in values]),
+            index=pd.Index(indices, name="Sample_Index"),
+            columns=values[0].index,
+        )
 
     def _aggregate_dict_multi_ein(self) -> None:
-        """Aggregate ``Dict[Ein, Series]`` kinematic outputs by incident energy.
+        """Align scattering kernels and angular distributions by incident energy.
+
+        Notes
+        -----
+        Populates `scattering_kernel_dict` and `angular_distribution_dict`
+        for the observables present in the stochastic results.
         """
-        attributes = [
-            "scattering_kernel",
-            "angular_distribution",
-        ]
-
-        for attr in attributes:
-            available = [
-                result
-                for result in self.raw_results
-                if getattr(result.integ, attr) is not None
-            ]
-            if not available:
-                continue
-
-            eins = sorted(
-                {
-                    ein
-                    for result in available
-                    for ein in getattr(result.integ, attr).keys()
-                }
-            )
-            aggregated_dict = {}
-
-            for ein in eins:
-                series_by_sample = [
-                    (result.sample_index, getattr(result.integ, attr)[ein])
-                    for result in available
-                    if ein in getattr(result.integ, attr)
-                ]
-                if series_by_sample:
-                    aggregated_dict[ein] = self._align_series_collection(
-                        series_by_sample
-                    )
-
-            setattr(self, f"{attr}_dict", aggregated_dict)
+        for attribute in ("scattering_kernel", "angular_distribution"):
+            self._aggregate_by_incident_energy(attribute, from_frame=False)
 
     def _aggregate_dataframe_multi_ein(self) -> None:
-        """Aggregate DataFrame-shaped kinematic outputs by incident energy.
+        """Align cosine and energy distributions by incident energy.
+
+        Notes
+        -----
+        Populates `cosine_distribution_dict` and `energy_distribution_dict`
+        for the observables present in the stochastic results.
         """
-        attributes = [
-            "cosine_distribution",
-            "energy_distribution",
-        ]
+        for attribute in ("cosine_distribution", "energy_distribution"):
+            self._aggregate_by_incident_energy(attribute, from_frame=True)
 
-        for attr in attributes:
-            available = [
-                result
-                for result in self.raw_results
-                if getattr(result.integ, attr) is not None
-            ]
-            if not available:
-                continue
+    def _aggregate_by_incident_energy(self, attribute: str, *, from_frame: bool) -> None:
+        """Build one sample-aligned matrix per available incident energy.
 
-            eins = sorted(
-                {
-                    ein
-                    for result in available
-                    for ein in getattr(result.integ, attr).index
-                }
-            )
-            aggregated_dict = {}
+        Parameters
+        ----------
+        attribute : str
+            Integral observable to aggregate.
+        from_frame : bool
+            Read incident energies from DataFrame rows when True, or mapping
+            keys otherwise.
 
-            for ein in eins:
-                series_by_sample = [
-                    # Multi-Ein frames use an outer join of native coordinates.
-                    # Missing cells are absent support, not nonfinite physics.
-                    (result.sample_index, getattr(result.integ, attr).loc[ein].dropna())
-                    for result in available
-                    if ein in getattr(result.integ, attr).index
-                ]
-                if series_by_sample:
-                    aggregated_dict[ein] = self._align_series_collection(
-                        series_by_sample
-                    )
+        Notes
+        -----
+        Stores a mapping from incident energy to a sample-indexed DataFrame
+        in the corresponding ``*_dict`` attribute. Samples contribute only
+        at incident energies present in their result.
+        """
+        outputs = self._integral_outputs(attribute)
+        if not outputs:
+            return
 
-            setattr(self, f"{attr}_dict", aggregated_dict)
+        by_energy: dict[float, list[tuple[int, pd.Series]]] = {}
+        for sample_index, data in outputs:
+            if from_frame:
+                # An outer join leaves NaN where a sample has no native support.
+                rows = ((energy, data.loc[energy].dropna()) for energy in dict.fromkeys(data.index))
+            else:
+                rows = data.items()
+            for energy, series in rows:
+                by_energy.setdefault(energy, []).append((sample_index, series))
+
+        setattr(self, f"{attribute}_dict", {
+            energy: self._align_series_collection(by_energy[energy])
+            for energy in sorted(by_energy)
+        })
 
     def extract(self, keys: List[str]) -> Any:
         """
@@ -568,47 +616,76 @@ class EnsembleAnalyzer:
         Parameters
         ----------
         keys : list of str
-            Aggregated analyzer attributes to place in the returned container.
+            Property names such as "thermo", "xs_total", or "scattering_kernel".
 
         Returns
         -------
         EnsemblePhysicsData
-            Pure-state container containing the requested computed properties.
+            Available requested properties and any sample or reference metadata.
+
+        Notes
+        -----
+        Missing, empty, or unrecognized properties are reported through the
+        logger and omitted from the result.
         """
         from .physics.data_models import EnsemblePhysicsData
 
-        ensemble_data = EnsemblePhysicsData()
-        sample_metadata = {result.sample_index: result.metadata
-                           for result in self.raw_results if result.metadata is not None}
-        reference_metadata = (None if self.reference_result is None
-                              else self.reference_result.metadata)
-        if sample_metadata or reference_metadata is not None:
-            ensemble_data.metadata = {"samples": sample_metadata,
-                                      "reference": reference_metadata}
-
+        ensemble_data = EnsemblePhysicsData(metadata=self._result_metadata())
         for key in keys:
-            target_df = f"{key}_df"
-            target_dict = f"{key}_dict"
-
-            if hasattr(self, target_df):
-                df = getattr(self, target_df)
-                if df is not None and not df.empty:
-                    setattr(ensemble_data, key, df)
-                else:
-                    logging.warning("Key '%s' was requested but is empty.", key)
-            elif hasattr(self, target_dict):
-                data = getattr(self, target_dict)
-                if data:
-                    setattr(ensemble_data, key, data)
-                else:
-                    logging.warning("Key '%s' was requested but is empty.", key)
-            else:
-                logging.warning(
-                    "Key '%s' is not a recognized computed attribute.",
-                    key,
-                )
-
+            output = self._get_aggregated_output(key)
+            if output is not None:
+                setattr(ensemble_data, key, output)
         return ensemble_data
+
+    def _result_metadata(self) -> dict | None:
+        """Collect available metadata while keeping the reference separate.
+
+        Returns
+        -------
+        dict or None
+            Metadata indexed by stochastic sample plus a separate reference
+            entry, or None if neither source has metadata.
+        """
+        samples = {
+            result.sample_index: result.metadata
+            for result in self.raw_results
+            if result.metadata is not None
+        }
+        reference = None if self.reference_result is None else self.reference_result.metadata
+        if samples or reference is not None:
+            return {"samples": samples, "reference": reference}
+        return None
+
+    def _get_aggregated_output(self, key: str) -> pd.DataFrame | dict | None:
+        """Resolve one requested property and report unavailable results.
+
+        Parameters
+        ----------
+        key : str
+            Property name without the internal storage suffix.
+
+        Returns
+        -------
+        pandas.DataFrame, dict, or None
+            Available result, with DataFrame storage taking precedence when
+            present. Returns None for empty or unrecognized results.
+        """
+        frame_name = f"{key}_df"
+        mapping_name = f"{key}_dict"
+        if hasattr(self, frame_name):
+            frame = getattr(self, frame_name)
+            if frame is not None and not frame.empty:
+                return frame
+        elif hasattr(self, mapping_name):
+            mapping = getattr(self, mapping_name)
+            if mapping:
+                return mapping
+        else:
+            logging.warning("Key '%s' is not a recognized computed attribute.", key)
+            return None
+
+        logging.warning("Key '%s' was requested but is empty.", key)
+        return None
 
     def reduce(
         self,
@@ -619,6 +696,24 @@ class EnsembleAnalyzer:
 
         Original ensemble indices and provenance are preserved.
         Previously computed results are reused when available.
+
+        Parameters
+        ----------
+        sample_indices : sequence of int
+            Original ensemble indices to retain, in the requested order.
+            Every index must belong to the current analyzer selection.
+
+        Returns
+        -------
+        EnsembleAnalyzer
+            Analyzer sharing the source ensemble, backend adapters, and
+            reference result, with stochastic results in the requested order.
+
+        Raises
+        ------
+        ValueError
+            If indices are empty, repeated, out of range, not one-dimensional,
+            or outside the current analyzer selection.
         """
         indices = self._validate_sample_indices(sample_indices)
 
@@ -634,22 +729,26 @@ class EnsembleAnalyzer:
             sample_indices=indices,
         )
 
-        # Reuse computed results without running the backend again.
         if self.raw_results:
-            results_by_index = {
-                result.sample_index: result
-                for result in self.raw_results
-            }
-
-            reduced.raw_results = [
-                results_by_index[int(index)]
-                for index in indices
-                if int(index) in results_by_index
-            ]
-
+            reduced.raw_results = self._select_cached_results(indices)
             reduced._aggregate_dataframes()
 
         # Reference is independent of stochastic sample selection.
         reduced.reference_result = self.reference_result
-
         return reduced
+
+    def _select_cached_results(self, indices: Sequence[int]) -> list[PhysicsData]:
+        """Select completed calculations in the requested sample order.
+
+        Parameters
+        ----------
+        indices : sequence of int
+            Original ensemble indices to retain.
+
+        Returns
+        -------
+        list of PhysicsData
+            Cached calculations for the requested samples that were evaluated.
+        """
+        results = {result.sample_index: result for result in self.raw_results}
+        return [results[int(index)] for index in indices if int(index) in results]

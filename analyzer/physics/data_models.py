@@ -34,10 +34,14 @@ class ThermodynamicsData:
     log_moment : float
         Logarithmic moment of the vibrational spectrum.
     """
+
+    # Effective temperature and displacement quantities.
     teff: float
     msd: float
     debye_waller: float
     b_factor: float
+
+    # Thermodynamic quantities and spectral moment.
     cv: float
     entropy: float
     zero_point_energy: float
@@ -67,6 +71,8 @@ class DifferentialData:
     alpha on the row index and signed beta on the columns. Backend-native
     compact representations are normalized before assignment.
     """
+
+    # Multiphonon kernel and differential scattering tables.
     gn: Optional[pd.Series] = None
     sab: Optional[pd.DataFrame] = None
     dynamic_structure_factor: Optional[Dict[float, pd.DataFrame]] = None
@@ -108,20 +114,20 @@ class IntegralData:
         Fraction of scattering events classified as elastic scattering.
         Default is None.
     """
-    # Cross Sections
+    # Cross sections.
     xs_total: Optional[pd.Series] = None
     xs_inelastic: Optional[pd.Series] = None
     xs_coherent_elastic: Optional[pd.Series] = None
     xs_incoherent_elastic: Optional[pd.Series] = None
     xs_absorption: Optional[pd.Series] = None
 
-    # Kinematic Distributions (Multi-Ein support)
+    # Scattering distributions.
     scattering_kernel: Optional[Dict[float, pd.Series]] = None
     angular_distribution: Optional[Dict[float, pd.Series]] = None
     cosine_distribution: Optional[pd.DataFrame] = None
     energy_distribution: Optional[pd.DataFrame] = None
     
-    # Ratios
+    # Scattering ratios.
     upscattering_ratio: Optional[pd.Series] = None
     downscattering_ratio: Optional[pd.Series] = None
     elastic_ratio: Optional[pd.Series] = None
@@ -147,6 +153,8 @@ class PhysicsData:
     metadata : dict or None, optional
         Additional evaluation metadata. Default is None.
     """
+
+    # Sample identity and evaluated observables.
     sample_index: int
     thermo: ThermodynamicsData
     diff: DifferentialData
@@ -192,21 +200,24 @@ class EnsemblePhysicsData:
     metadata : dict or None, optional
         Additional evaluation metadata. Default is None.
     """
-    # 1D Integrals & Scalars aggregated into 2D DataFrames
+    # Thermodynamic and cross-section matrices.
     thermo: Optional[pd.DataFrame] = None
     xs_total: Optional[pd.DataFrame] = None
     xs_inelastic: Optional[pd.DataFrame] = None
     xs_coherent_elastic: Optional[pd.DataFrame] = None
     xs_incoherent_elastic: Optional[pd.DataFrame] = None
     xs_absorption: Optional[pd.DataFrame] = None
+
+    # Scattering-ratio matrices.
     upscattering_ratio: Optional[pd.DataFrame] = None
     downscattering_ratio: Optional[pd.DataFrame] = None
     elastic_ratio: Optional[pd.DataFrame] = None
     
-    # Multi-Ein Kinematic Distributions aggregated into Dictionaries of 2D DataFrames
+    # Scattering distributions across samples.
     scattering_kernel: Optional[Dict[float, pd.DataFrame]] = None
     angular_distribution: Optional[Dict[float, pd.DataFrame]] = None
     cosine_distribution: Optional[Dict[float, pd.DataFrame]] = None
     energy_distribution: Optional[Dict[float, pd.DataFrame]] = None
 
+    # Ensemble metadata.
     metadata: Optional[dict] = None

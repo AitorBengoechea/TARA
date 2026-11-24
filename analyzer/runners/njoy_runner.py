@@ -95,11 +95,15 @@ class NjoyRunner(BaseRunner):
             thermr_nbin=kwargs.get("thermr_nbin", 16),
             export_full_spectra=kwargs.get("export_full_spectra", False),
         ) as execution:
+            # Read both tapes while the Processing context still owns the temporary
+            # files.
             leapr_tree = self.endf_parser.parsefile(
                 str(execution.tape_path("tape24"))
             )
 
             thermr_tree = None
+            # An absent THERMR tape leaves the LEAPR scattering law available for
+            # parsing.
             if execution.has_tape("tape26"):
                 thermr_tree = self.endf_parser.parsefile(
                     str(execution.tape_path("tape26")),

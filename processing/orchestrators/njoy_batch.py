@@ -182,6 +182,8 @@ class NjoyBatchOrchestrator:
         tuple
             Per-sample worker positional and keyword arguments.
         """
+        # Reserve sample_000 for the reference and start stochastic output names at
+        # sample_001.
         yield self._leapr_call(
             "sample_000", ensemble.reference, template_path, output_dir, temperature,
             material_state=material_state, export_full_spectra=export_full_spectra,

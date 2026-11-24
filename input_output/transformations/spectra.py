@@ -29,6 +29,8 @@ def to_leapr_grid(spectrum: ContinuousSpectrum) -> ContinuousSpectrum:
         target_e = np.arange(nstart + len(e), dtype=float) * delta
         target_g = np.r_[y[0] * (target_e[:nstart] / e[0])**2, y]
     else:
+        # Keep the last LEAPR node at or below the source endpoint when the grids do not
+        # align.
         n = int(np.floor(e[-1] / delta + 1e-10)) + 1
         target_e = np.arange(n, dtype=float) * delta
         target_g = np.interp(target_e, e, y)

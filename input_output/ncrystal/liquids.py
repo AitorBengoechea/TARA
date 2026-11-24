@@ -45,11 +45,16 @@ class LiquidAtomSettings:
     Q values with positive S(Q).
     """
 
+    # Species and translation model.
     atom: str
     model: str
+
+    # Diffusion parameter and component weights.
     c: float
     wt: float
     ws: float
+
+    # Liquid structure and kernel options.
     static_structure_factor: tuple[tuple[float, float], ...] = ()
     yk_model: str | None = None
 
@@ -330,6 +335,8 @@ def replace_custom_liquids(text: str, entries: Iterable[LiquidAtomSettings]) -> 
     header, sections = _split_ncmat(text)
     if sum(tag == "CUSTOM_LIQUIDS" for tag, _ in sections) != 1:
         raise ValueError("Expected exactly one @CUSTOM_LIQUIDS block.")
+    # Replace the custom block in place so section order and unrelated material text are
+    # preserved.
     liquid = render_custom_liquids(entries)
     return header + "".join(liquid if tag == "CUSTOM_LIQUIDS" else raw
                             for tag, raw in sections)

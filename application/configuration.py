@@ -188,6 +188,7 @@ def load_ace_config(filename: str | Path) -> AceApplicationConfig:
             f"missing={sorted(missing_sections)}."
         )
 
+    # Validate TOML keys and types before checking relationships between settings.
     sections: dict[str, dict[str, Any]] = {}
     for group, fields in _SCHEMA.items():
         if group == "diffusion_sampling" and group not in raw:
@@ -223,6 +224,7 @@ def load_ace_config(filename: str | Path) -> AceApplicationConfig:
     if diffusion.enabled and (sections['material'].get('state', 'solid') != 'liquid'
                               or sections['workflow']['backend'] != 'njoy'):
         raise ApplicationConfigError('Diffusion sampling requires NJOY liquid material.')
+    # Joint sampling keeps the acoustic origin fixed when energy shifts are enabled.
     if (diffusion.enabled and sections['sampling']['max_energy_shift_mev'] > 0
             and not sections['sampling']['freeze_origin']):
         raise ApplicationConfigError(

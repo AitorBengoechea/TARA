@@ -531,9 +531,12 @@ class TranslationDiagnostics:
         Effective source ranges after valley snapping.
     """
 
+    # Domain boundaries and reconstruction guards.
     nominal_boundaries: np.ndarray
     effective_boundaries: np.ndarray
     reconstruction_guard_widths: np.ndarray
+
+    # Segment shifts and ranges.
     segment_shifts_eV: np.ndarray
     segment_ranges: Tuple[Tuple[float, float], ...]
 

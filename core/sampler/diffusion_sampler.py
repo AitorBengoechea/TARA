@@ -101,5 +101,7 @@ class DiffusionSampler:
                 )[:, 0]
         dynamics = self.model.dynamics
         weights = dynamics.translation_weight * w_factor
+        # Scaled diffusivity is proportional to wt * c. Divide by the weight factor to
+        # realize the requested diffusivity draw.
         c_values = dynamics.translation_parameter * d_factor / w_factor
         return MaterialEnsemble(self.model, weights, c_values, spectra_ensemble)

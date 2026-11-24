@@ -86,6 +86,8 @@ class ParameterSpaceSampler:
         )
         output = np.empty((n_samples, n_dimensions), dtype=np.float64)
         for column in range(n_dimensions):
+            # Assign every stratum once per column, then jitter uniformly within each
+            # stratum.
             permutation = local_rng.permutation(n_samples)
             jitter = local_rng.random(n_samples)
             output[:, column] = 2.0 * (permutation + jitter) / n_samples - 1.0

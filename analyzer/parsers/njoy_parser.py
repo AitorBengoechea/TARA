@@ -19,13 +19,10 @@ from analyzer.physics.thermodynamics import (
 
 
 class NjoyParser(BaseTslParser):
+    """Extract NJOY ENDF observables into the shared Analyzer physics schema."""
 
-    """Extract NJOY ENDF observables into the shared Analyzer physics schema.
-    """
     def parse(self, sample_index: int, engine: NjoyEngine, **kwargs) -> PhysicsData:
-        """Orchestrates the extraction of physical data into the unified schema.
-
-        Extract only available backend observables and populate the shared PhysicsData schema.
+        """Parse the requested observables from one evaluated sample.
 
         Parameters
         ----------
@@ -39,7 +36,7 @@ class NjoyParser(BaseTslParser):
         Returns
         -------
         PhysicsData
-            Calculated result in the declared return type.
+            Requested observables from the available NJOY tapes.
         """
         thermo = self._thermodynamics_for(engine, kwargs.get("calc_thermodynamics", True))
         diff = DifferentialData()
@@ -51,7 +48,7 @@ class NjoyParser(BaseTslParser):
         return PhysicsData(sample_index=sample_index, thermo=thermo, diff=diff, integ=integ)
 
     def _extract_thermodynamics(self, engine: NjoyEngine) -> ThermodynamicsData:
-        """Evaluates static scalars and properties strictly using Numba kernels.
+        """Calculate thermodynamic observables from the evaluated spectrum.
 
         Parameters
         ----------
@@ -61,7 +58,7 @@ class NjoyParser(BaseTslParser):
         Returns
         -------
         ThermodynamicsData
-            Calculated result in the declared return type.
+            Spectrum-derived thermodynamic and displacement quantities.
         """
         pdos, E = _with_debye_tail(engine.pdos, engine.energy_grid)
         temp = engine.temperature
@@ -70,22 +67,48 @@ class NjoyParser(BaseTslParser):
         teff = calc_teff_numba(pdos, E, temp)
         msd = calc_msd_numba(pdos, E, temp, mass_amu)
 
-        b_factor = (8 * np.pi**2 * msd / 3) if msd else 0.0
-        debye_waller = 0.0
-        if msd:
-            amu_kg = physical_constants['atomic mass constant'][0]
-            msd_m2 = msd * (1e-10)**2
-            mass_kg = mass_amu * amu_kg
-            debye_waller = msd_m2 * (2 * mass_kg * k * temp / hbar**2)
-
+        debye_waller, b_factor = self._displacement_factors(msd, mass_amu, temp)
         return ThermodynamicsData(
-            teff=teff, msd=msd, debye_waller=debye_waller, b_factor=b_factor,
-            cv=calc_cv_numba(pdos, E, temp), entropy=calc_entropy_numba(pdos, E, temp),
+            teff=teff,
+            msd=msd,
+            debye_waller=debye_waller,
+            b_factor=b_factor,
+            cv=calc_cv_numba(pdos, E, temp),
+            entropy=calc_entropy_numba(pdos, E, temp),
             zero_point_energy=calc_zero_point_energy_numba(pdos, E),
             free_energy=calc_free_energy_numba(pdos, E, temp),
             internal_energy=calc_internal_energy_numba(pdos, E, temp),
-            log_moment=calc_log_moment_numba(pdos, E)
+            log_moment=calc_log_moment_numba(pdos, E),
         )
+
+    @staticmethod
+    def _displacement_factors(msd, mass_amu, temperature):
+        """Calculate the Debye–Waller coefficient and crystallographic B factor.
+
+        Parameters
+        ----------
+        msd : float
+            Mean-square displacement in square ångströms.
+        mass_amu : float
+            Target mass in atomic mass units.
+        temperature : float
+            Material temperature in kelvin.
+
+        Returns
+        -------
+        tuple of float
+            Dimensionless Debye–Waller coefficient and B factor in square
+            ångströms.
+        """
+        if not msd:
+            return 0.0, 0.0
+
+        # Convert displacement and mass to SI for the coefficient.
+        msd_m2 = msd * (1e-10)**2
+        mass_kg = mass_amu * physical_constants['atomic mass constant'][0]
+        debye_waller = msd_m2 * (2 * mass_kg * k * temperature / hbar**2)
+        b_factor = 8 * np.pi**2 * msd / 3
+        return debye_waller, b_factor
 
     def _extract_cross_sections(self, engine: NjoyEngine, integ: IntegralData, **kwargs) -> None:
         """Extract available thermal-scattering MF3 cross sections.
@@ -124,20 +147,56 @@ class NjoyParser(BaseTslParser):
             integ.xs_inelastic = inelastic
 
         if kwargs.get('calc_xs_elastic', True) and elastic is not None:
-            if elastic_type == 1:
-                integ.xs_coherent_elastic = elastic
-            elif elastic_type == 2:
-                integ.xs_incoherent_elastic = elastic
-            # For LTHR=3 (mixed) or unknown elastic type, a single
-            # MF3/MT222 curve cannot be split into physical components.
+            self._store_elastic_channel(integ, elastic, elastic_type)
 
-        if kwargs.get('calc_xs_total', True) and inelastic is not None:
-            if elastic is not None:
-                integ.xs_total = inelastic + elastic
-            elif elastic_type == 0:
-                # MF7/MT2 is absent: this thermal model contains no
-                # elastic contribution, so its scattering sum is inelastic.
-                integ.xs_total = inelastic.copy()
+        if kwargs.get('calc_xs_total', True):
+            total = self._thermal_scattering_total(inelastic, elastic, elastic_type)
+            if total is not None:
+                integ.xs_total = total
+
+    @staticmethod
+    def _store_elastic_channel(integ, elastic, elastic_type):
+        """Store the elastic curve when its scattering type is resolved.
+
+        Parameters
+        ----------
+        integ : IntegralData
+            Destination for the resolved elastic channel.
+        elastic : pandas.Series
+            THERMR MT=222 cross section in barns.
+        elastic_type : int
+            LEAPR elastic type from MF7/MT2.
+        """
+        # A single MT=222 curve for LTHR=3 combines both elastic components.
+        if elastic_type == 1:
+            integ.xs_coherent_elastic = elastic
+        elif elastic_type == 2:
+            integ.xs_incoherent_elastic = elastic
+
+    @staticmethod
+    def _thermal_scattering_total(inelastic, elastic, elastic_type):
+        """Combine THERMR contributions when the available curves define a total.
+
+        Parameters
+        ----------
+        inelastic, elastic : pandas.Series or None
+            THERMR inelastic and elastic cross sections in barns.
+        elastic_type : int
+            LEAPR elastic type, or zero when MF7/MT2 is absent.
+
+        Returns
+        -------
+        pandas.Series or None
+            Total thermal scattering cross section when available.
+        """
+        if inelastic is None:
+            return None
+        if elastic is not None:
+            return inelastic + elastic
+        if elastic_type == 0:
+            # An absent MF7/MT2 marks a model with no elastic contribution.
+            return inelastic.copy()
+        return None
 
     @staticmethod
     def _thermr_xs(mf3, mt: int, energy_grid: np.ndarray):
@@ -218,67 +277,94 @@ class NjoyParser(BaseTslParser):
         """
         if not engine.leapr_tree:
             return
+        if not (kwargs.get('calc_sab', False) or any(self._requested_outputs(kwargs).values())):
+            return
 
-        kinematic_flags = [
-            'calc_sab', 'calc_dsf', 'calc_scattering_kernel',
-            'calc_angular_distribution', 'calc_cosine_distribution',
-            'calc_energy_distribution', 'calc_ratios'
-        ]
-
-        sab_df = None
-        if any(kwargs.get(flag, False) for flag in kinematic_flags):
-            mf7_mt4 = engine.leapr_tree.get(7, {}).get(4, {})
-            beta_table = mf7_mt4.get('beta', {})
-            s_table = mf7_mt4.get('S_table', {})
-
-            beta_keys = sorted(set(beta_table) & set(s_table))
-            if beta_keys:
-                # The produced ENDF tape is authoritative. The LEAPR Card 4
-                # request does not replace the actual LASYM/LLN metadata.
-                try:
-                    lasym = int(mf7_mt4['LASYM'])
-                    lln = int(mf7_mt4['LLN'])
-                except (KeyError, TypeError, ValueError, OverflowError) as exc:
-                    raise ValueError(
-                        'NJOY MF7/MT4 requires valid LASYM and LLN metadata.'
-                    ) from exc
-                if lasym not in (0, 1) or lln not in (0, 1):
-                    raise ValueError('NJOY MF7/MT4 LASYM and LLN must be 0 or 1.')
-
-                betas = np.array([beta_table[i] for i in beta_keys], dtype=float)
-                alphas = np.array(s_table[beta_keys[0]]['alpha'], dtype=float)
-                sab_columns = []
-
-                for i in beta_keys:
-                    alpha_i = np.array(s_table[i]['alpha'], dtype=float)
-                    s_i = np.array(s_table[i]['S'], dtype=float)
-
-                    if alpha_i.shape != alphas.shape or not np.allclose(alpha_i, alphas):
-                        raise ValueError("Inconsistent alpha grid across NJOY MF7/MT4 beta records.")
-                    if s_i.shape != alphas.shape:
-                        raise ValueError("NJOY MF7/MT4 S(alpha,beta) column does not match alpha grid.")
-
-                    sab_columns.append(s_i)
-
-                sab_values = np.column_stack(sab_columns)
-                sab_df = decode_njoy_mf7_sab(
-                    pd.DataFrame(
-                        sab_values,
-                        columns=pd.Index(betas, name='beta'),
-                        index=pd.Index(alphas, name='alpha'),
-                    ),
-                    lasym=lasym,
-                    lln=lln,
-                )
-
-        if sab_df is not None:
-            # The decoder has already made the physical full signed S.
-            # BaseTslParser recognizes it as full and does not rebalance it.
+        section = engine.leapr_tree.get(7, {}).get(4, {})
+        table = self._decode_thermal_law(section)
+        if table is not None:
+            # The decoder has already expanded the law to full signed beta.
             self._apply_universal_kinematics(
-                sab_df,
-                diff,
-                integ,
-                engine.temperature,
-                engine.mass_amu,
-                **kwargs,
+                table, diff, integ, engine.temperature, engine.mass_amu, **kwargs,
             )
+
+    @classmethod
+    def _decode_thermal_law(cls, section):
+        """Decode the available MF7/MT4 records into a physical scattering law.
+
+        Parameters
+        ----------
+        section : dict
+            Parsed MF7/MT4 section from the LEAPR output tape.
+
+        Returns
+        -------
+        pandas.DataFrame or None
+            Full scattering law with alpha rows and signed beta columns.
+        """
+        beta_table = section.get('beta', {})
+        records = section.get('S_table', {})
+        # Pair beta coordinates and scattering-law records by ENDF record index.
+        record_keys = sorted(set(beta_table) & set(records))
+        if not record_keys:
+            return None
+
+        lasym, lln = cls._thermal_law_flags(section)
+        beta = np.array([beta_table[key] for key in record_keys], dtype=float)
+        alpha, values = cls._stack_thermal_law_columns(records, record_keys)
+        table = pd.DataFrame(
+            values, index=pd.Index(alpha, name='alpha'), columns=pd.Index(beta, name='beta'),
+        )
+        return decode_njoy_mf7_sab(table, lasym=lasym, lln=lln)
+
+    @staticmethod
+    def _thermal_law_flags(section):
+        """Read the symmetry and logarithmic-storage flags from MF7/MT4.
+
+        Parameters
+        ----------
+        section : dict
+            Parsed MF7/MT4 section.
+
+        Returns
+        -------
+        tuple of int
+            LASYM and LLN representation flags.
+        """
+        # The output tape records the actual representation used by LEAPR.
+        try:
+            lasym = int(section['LASYM'])
+            lln = int(section['LLN'])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError('NJOY MF7/MT4 requires valid LASYM and LLN metadata.') from exc
+        if lasym not in (0, 1) or lln not in (0, 1):
+            raise ValueError('NJOY MF7/MT4 LASYM and LLN must be 0 or 1.')
+        return lasym, lln
+
+    @staticmethod
+    def _stack_thermal_law_columns(records, record_keys):
+        """Collect beta records that share a single alpha axis.
+
+        Parameters
+        ----------
+        records : dict
+            Scattering-law records keyed by their ENDF indices.
+        record_keys : sequence of int
+            Record keys in beta-column order.
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            Common alpha axis and scattering-law matrix.
+        """
+        alpha = np.array(records[record_keys[0]]['alpha'], dtype=float)
+        columns = []
+        for key in record_keys:
+            coordinates = np.array(records[key]['alpha'], dtype=float)
+            values = np.array(records[key]['S'], dtype=float)
+            if coordinates.shape != alpha.shape or not np.allclose(coordinates, alpha):
+                raise ValueError("Inconsistent alpha grid across NJOY MF7/MT4 beta records.")
+            if values.shape != alpha.shape:
+                raise ValueError("NJOY MF7/MT4 S(alpha,beta) column does not match alpha grid.")
+            columns.append(values)
+        return alpha, np.column_stack(columns)

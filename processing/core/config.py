@@ -48,18 +48,26 @@ class AceGenerationConfig:
         Elastic thermal reaction MT; ``None`` preserves the legacy
         ``elas_mat`` value and zero denotes no ACE elastic reaction.
     """
+
+    # Input evaluation and material identifiers.
     base_endf_path: str
     base_za: int
     base_mat: int
     tsl_mat: int
+
+    # Thermal scattering settings.
     temperature: float
     icoh: int
     natom: int
     emax: float
+
+    # ACE table suffix and isotope identifiers.
     suffix: str
     za1: int
     za2: int
     za3: int
+
+    # Elastic treatment and ACER controls.
     elas_mat: int
     ielas: int
     nbin: int = 16
