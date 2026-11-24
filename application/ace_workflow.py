@@ -196,7 +196,8 @@ def _ncrystal_tapes(
     material = config.section('material')
     temperature = material['temperature_k']
     n_jobs = config.section('execution')['n_jobs']
-    return NcrystalBatchOrchestrator(n_jobs=n_jobs).generate_ensemble_sab_tapes(
+    orchestrator = NcrystalBatchOrchestrator(n_jobs=n_jobs)
+    return orchestrator.generate_ensemble_sab_tapes(
         ensemble=ensemble, output_dir=str(endf_dir),
         base_ncmat_file=str(template), temperature=temperature,
         atom_label=material['atom_label'], elastic_mode=material['elastic_mode'],
@@ -259,9 +260,10 @@ def _process_njoy(config: AceApplicationConfig, endf_dir: Path, njoy: Path):
     execution = config.section('execution')
     # Preserve the original call signature for legacy solid configurations.
     state_options = {'material_state': material['state']} if 'state' in material else {}
-    tapes = NjoyBatchOrchestrator(
+    orchestrator = NjoyBatchOrchestrator(
         njoy_exec=str(njoy), n_jobs=execution['n_jobs'],
-    ).generate_ensemble_sab_tapes(
+    )
+    tapes = orchestrator.generate_ensemble_sab_tapes(
         ensemble=samples, output_dir=str(endf_dir),
         base_leapr_file=str(source),
         temperature=material['temperature_k'],
@@ -641,9 +643,10 @@ def _convert_ace_batch(
         nbin=opts['nbin'], tol=opts['tolerance'],
         **_ace_reaction_overrides(material, opts),
     )
-    return UniversalAcePipeline(
+    pipeline = UniversalAcePipeline(
         njoy_exec=str(njoy), n_jobs=config.section('execution')['n_jobs'],
-    ).run(
+    )
+    return pipeline.run(
         sab_tapes=tapes, output_dir=str(output / 'ace'),
         config=ace_options, save_xsdir=opts['save_xsdir'],
     )
@@ -703,7 +706,8 @@ def run_ncrystal_native_ensemble(
 
     load_liquid_ncmat(ncmat_template)
     energies = np.geomspace(1e-5, 1.0, 90) if energies_ev is None else energies_ev
-    return NcrystalBatchOrchestrator().generate_native_ensemble(
+    orchestrator = NcrystalBatchOrchestrator()
+    return orchestrator.generate_native_ensemble(
         ensemble, str(output_dir), str(ncmat_template), temperature_k,
         atom_label, energies, sample_energy_ev=event_energy_ev,
         n_events=n_events, physical_model=physical_model,

@@ -91,31 +91,49 @@ class AceApplicationConfig:
 
     Parameters
     ----------
-    file_path : Path
-        Path to the input TOML file.
-    sections : dict[str, dict[str, Any]]
+    file_path : pathlib.Path
+        Absolute path to the input TOML file.
+    sections : dict of str to dict
         Validated configuration tables keyed by section name.
 
-    Notes
-    -----
     Attributes
     ----------
-    file_path : pathlib.Path
-        Absolute path to the source TOML document.
-    sections : dict of str to dict
-        Validated, independent section dictionaries.
+    backend
+        ACE generation backend selected in the workflow table.
     """
 
     file_path: Path
     sections: dict[str, dict[str, Any]]
 
     def section(self, name: str) -> dict[str, Any]:
-        """Return a copy of one validated configuration section."""
+        """Return a shallow copy of one validated configuration section.
+
+        Parameters
+        ----------
+        name : str
+            TOML section name.
+
+        Returns
+        -------
+        dict
+            Section values keyed by setting name.
+
+        Raises
+        ------
+        KeyError
+            If the section is absent.
+        """
         return dict(self.sections[name])
 
     @property
     def backend(self) -> str:
-        """Return the requested ACE generation backend."""
+        """Return the requested ACE generation backend.
+
+        Returns
+        -------
+        str
+            Backend name, either "njoy" or "ncrystal".
+        """
         return self.sections["workflow"]["backend"]
 
     def path(self, section: str, key: str) -> Path:
@@ -125,13 +143,33 @@ class AceApplicationConfig:
         ----------
         section, key : str
             Section and setting identifying the path.
+
+        Returns
+        -------
+        pathlib.Path
+            Absolute, resolved path.
         """
         raw = self.sections[section][key]
         return (self.file_path.parent / raw).resolve()
 
 
 def _check_type(section: str, key: str, value: Any, expected: type) -> None:
-    """Verify exact TOML scalar types and reject nonfinite floats."""
+    """Check a setting against its declared TOML type.
+
+    Parameters
+    ----------
+    section, key : str
+        TOML section and setting used in error messages.
+    value : object
+        Parsed TOML value.
+    expected : type
+        Required type. Float settings also accept finite integers.
+
+    Raises
+    ------
+    ApplicationConfigError
+        If the value has the wrong type or a numeric setting is nonfinite.
+    """
     if expected is float:
         good = type(value) in (int, float) and math.isfinite(value)
     else:
@@ -143,7 +181,22 @@ def _check_type(section: str, key: str, value: Any, expected: type) -> None:
 
 
 def _number(value: Any, location: str, *, positive: bool = False) -> None:
-    """Validate a finite physical or numerical control."""
+    """Validate a finite number with an optional strict lower bound.
+
+    Parameters
+    ----------
+    value : object
+        Parsed value to validate.
+    location : str
+        Setting name used in error messages.
+    positive : bool, optional
+        Require a number greater than zero when True.
+
+    Raises
+    ------
+    ApplicationConfigError
+        If the value is nonnumeric, nonfinite, or violates the lower bound.
+    """
     if type(value) not in (float, int) or not math.isfinite(value):
         raise ApplicationConfigError(f"{location} must be a finite number.")
     if positive and value <= 0:
@@ -157,7 +210,7 @@ def load_ace_config(filename: str | Path) -> AceApplicationConfig:
     ----------
     filename : str or pathlib.Path
         TOML input path. Relative file paths within the TOML are resolved
-        from the directory containing that file, not the current directory.
+        from the directory containing that file.
 
     Returns
     -------
@@ -172,6 +225,42 @@ def load_ace_config(filename: str | Path) -> AceApplicationConfig:
         The file has invalid keys, types, or combinations.
     """
     source = Path(filename).expanduser().resolve()
+    sections = _validate_schema(_read_toml(source))
+    diffusion_enabled = _validate_diffusion(sections)
+
+    # Keep the historical prominence for configurations that omit the setting.
+    sampling = sections["sampling"]
+    sampling.setdefault("automatic_partition_prominence_pct", 1.0)
+    _validate_material(sections)
+    _validate_positive_controls(sections)
+    _validate_perturbation_bounds(sampling, diffusion_enabled)
+    _validate_execution_controls(sections)
+    _validate_sampling_methods(sampling)
+    _validate_manual_ranges(sampling)
+    _validate_path_settings(sections)
+    return AceApplicationConfig(file_path=source, sections=sections)
+
+
+def _read_toml(source: Path) -> dict[str, Any]:
+    """Read a TOML configuration from disk.
+
+    Parameters
+    ----------
+    source : pathlib.Path
+        Resolved configuration path.
+
+    Returns
+    -------
+    dict
+        Parsed TOML document.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the source is missing or is not a file.
+    ApplicationConfigError
+        If the TOML syntax is invalid.
+    """
     if not source.is_file():
         raise FileNotFoundError(f"ACE configuration not found: {source}")
     try:
@@ -179,7 +268,27 @@ def load_ace_config(filename: str | Path) -> AceApplicationConfig:
             raw = tomllib.load(stream)
     except tomllib.TOMLDecodeError as exc:
         raise ApplicationConfigError(f"Malformed TOML in {source}: {exc}") from exc
+    return raw
 
+
+def _validate_schema(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Validate section names, required keys, and setting types.
+
+    Parameters
+    ----------
+    raw : dict
+        Parsed TOML document.
+
+    Returns
+    -------
+    dict of str to dict
+        Validated shallow copies of the supplied tables.
+
+    Raises
+    ------
+    ApplicationConfigError
+        If a section or setting has an invalid name, shape, or type.
+    """
     unknown_sections = set(raw) - set(_SCHEMA)
     missing_sections = (set(_SCHEMA) - {"diffusion_sampling"}) - set(raw)
     if unknown_sections or missing_sections:
@@ -206,7 +315,27 @@ def load_ace_config(filename: str | Path) -> AceApplicationConfig:
         for key, value in values.items():
             _check_type(group, key, value, fields[key])
         sections[group] = dict(values)
+    return sections
 
+
+def _validate_diffusion(sections: dict[str, dict[str, Any]]) -> bool:
+    """Validate optional diffusion settings and their material requirements.
+
+    Parameters
+    ----------
+    sections : dict of str to dict
+        Schema-validated workflow, material, and sampling settings.
+
+    Returns
+    -------
+    bool
+        Whether diffusion sampling is enabled.
+
+    Raises
+    ------
+    ApplicationConfigError
+        If the diffusion settings conflict with the selected material or sampling.
+    """
     # Optional diffusion controls are entirely absent from historical files.
     from core.config import DiffusionSamplingConfig, TaraConfigError
     raw_diffusion = sections.get('diffusion_sampling', {})
@@ -232,9 +361,22 @@ def load_ace_config(filename: str | Path) -> AceApplicationConfig:
         )
     if 'diffusion_sampling' in sections:
         sections['diffusion_sampling'] = dict(raw_diffusion)
-    # Older ACE TOML files remain valid and preserve the historical 1% rule.
-    sections["sampling"].setdefault("automatic_partition_prominence_pct", 1.0)
+    return diffusion.enabled
 
+
+def _validate_material(sections: dict[str, dict[str, Any]]) -> None:
+    """Validate material sources and backend-specific reaction requirements.
+
+    Parameters
+    ----------
+    sections : dict of str to dict
+        Schema-validated configuration tables.
+
+    Raises
+    ------
+    ApplicationConfigError
+        If a setting or combination is invalid.
+    """
     workflow, material, ensemble = (sections[name] for name in
                                     ("workflow", "material", "ensemble"))
     backend = workflow["backend"]
@@ -268,22 +410,69 @@ def load_ace_config(filename: str | Path) -> AceApplicationConfig:
         if not material.get("atom_label") or not material.get("elastic_mode"):
             raise ApplicationConfigError("NCrystal requires atom_label and elastic_mode.")
 
+
+def _validate_positive_controls(sections: dict[str, dict[str, Any]]) -> None:
+    """Validate positive temperature and ACE controls.
+
+    Parameters
+    ----------
+    sections : dict of str to dict
+        Schema-validated configuration tables.
+
+    Raises
+    ------
+    ApplicationConfigError
+        If a setting or combination is invalid.
+    """
     for group, key in (("material", "temperature_k"), ("ace", "max_energy_ev"),
                        ("ace", "tolerance")):
         _number(sections[group][key], f"[{group}].{key}", positive=True)
+
+
+def _validate_perturbation_bounds(sampling: dict[str, Any], diffusion_enabled: bool) -> None:
+    """Validate vibrational limits and automatic partition prominence.
+
+    Parameters
+    ----------
+    sampling : dict
+        Vibrational sampling settings.
+    diffusion_enabled : bool
+        Whether diffusion supplies an active perturbation.
+
+    Raises
+    ------
+    ApplicationConfigError
+        If a setting or combination is invalid.
+    """
     for key in ("max_energy_shift_mev", "max_amplitude_shift_pct"):
-        value = sections["sampling"][key]
+        value = sampling[key]
         _number(value, f"[sampling].{key}")
         if value < 0:
             raise ApplicationConfigError(f"[sampling].{key} must be nonnegative.")
-    if not any(sections["sampling"][k] > 0 for k in
-               ("max_energy_shift_mev", "max_amplitude_shift_pct")) and not diffusion.enabled:
+    if not any(sampling[k] > 0 for k in
+               ("max_energy_shift_mev", "max_amplitude_shift_pct")) and not diffusion_enabled:
         raise ApplicationConfigError("At least one sampling perturbation bound must be positive.")
-    prominence_pct = sections["sampling"]["automatic_partition_prominence_pct"]
+    prominence_pct = sampling["automatic_partition_prominence_pct"]
     if not 0.0 < prominence_pct <= 100.0:
         raise ApplicationConfigError(
             "[sampling].automatic_partition_prominence_pct must be in (0, 100]."
         )
+
+
+def _validate_execution_controls(sections: dict[str, dict[str, Any]]) -> None:
+    """Apply the default design and validate ensemble and execution controls.
+
+    Parameters
+    ----------
+    sections : dict of str to dict
+        Schema-validated configuration tables.
+
+    Raises
+    ------
+    ApplicationConfigError
+        If a setting or combination is invalid.
+    """
+    ensemble = sections["ensemble"]
     ensemble.setdefault("sampling_method", "latin_hypercube")
     if ensemble["sampling_method"] not in ("latin_hypercube", "monte_carlo"):
         raise ApplicationConfigError(
@@ -300,9 +489,24 @@ def load_ace_config(filename: str | Path) -> AceApplicationConfig:
         raise ApplicationConfigError("[ace].nbin must be positive.")
     if not sections["ace"]["suffix"].strip():
         raise ApplicationConfigError("[ace].suffix cannot be empty.")
-    if sections["sampling"]["amplitude_method"] not in ("fast", "precise"):
+
+
+def _validate_sampling_methods(sampling: dict[str, Any]) -> None:
+    """Validate the choice of vibrational sampling strategies.
+
+    Parameters
+    ----------
+    sampling : dict
+        Vibrational sampling settings.
+
+    Raises
+    ------
+    ApplicationConfigError
+        If a setting or combination is invalid.
+    """
+    if sampling["amplitude_method"] not in ("fast", "precise"):
         raise ApplicationConfigError("[sampling].amplitude_method must be fast or precise.")
-    if sections["sampling"]["spatial_method"] not in ("diffeomorphic", "crossfade"):
+    if sampling["spatial_method"] not in ("diffeomorphic", "crossfade"):
         raise ApplicationConfigError("[sampling].spatial_method must be diffeomorphic or crossfade.")
     for key, allowed in {
         'grid_partition_method': ('automatic', 'manual'),
@@ -310,11 +514,26 @@ def load_ace_config(filename: str | Path) -> AceApplicationConfig:
         'correlation_strategy': ('independent', 'random_group'),
         'variable_coupling': ('independent', 'coupled'),
     }.items():
-        if sections['sampling'][key] not in allowed:
+        if sampling[key] not in allowed:
             raise ApplicationConfigError(
                 f"[sampling].{key} must be one of {allowed}."
             )
-    ranges = sections["sampling"].get("manual_energy_ranges", [])
+
+
+def _validate_manual_ranges(sampling: dict[str, Any]) -> None:
+    """Validate manual energy intervals and their partition mode.
+
+    Parameters
+    ----------
+    sampling : dict
+        Vibrational sampling settings.
+
+    Raises
+    ------
+    ApplicationConfigError
+        If a setting or combination is invalid.
+    """
+    ranges = sampling.get("manual_energy_ranges", [])
     for idx, item in enumerate(ranges):
         if not (isinstance(item, list) and len(item) == 2):
             raise ApplicationConfigError(f"[sampling].manual_energy_ranges[{idx}] must be [start, end].")
@@ -323,10 +542,26 @@ def load_ace_config(filename: str | Path) -> AceApplicationConfig:
         _number(b, f"manual_energy_ranges[{idx}][1]")
         if a < 0 or b <= a:
             raise ApplicationConfigError(f"manual_energy_ranges[{idx}] must satisfy 0 <= start < end.")
-    if sections["sampling"]["grid_partition_method"] == "manual" and not ranges:
+    if sampling["grid_partition_method"] == "manual" and not ranges:
         raise ApplicationConfigError("Manual grid partition requires manual_energy_ranges.")
-    if sections["sampling"]["grid_partition_method"] != "manual" and ranges:
+    if sampling["grid_partition_method"] != "manual" and ranges:
         raise ApplicationConfigError("manual_energy_ranges requires grid_partition_method='manual'.")
+
+
+def _validate_path_settings(sections: dict[str, dict[str, Any]]) -> None:
+    """Reject blank input, output, and executable path settings.
+
+    Parameters
+    ----------
+    sections : dict of str to dict
+        Schema-validated configuration tables.
+
+    Raises
+    ------
+    ApplicationConfigError
+        If a setting or combination is invalid.
+    """
+    material = sections["material"]
     for label in ("base_endf_file", "leapr_file", "ncmat_file"):
         if label in material and not material[label].strip():
             raise ApplicationConfigError(f"[material].{label} cannot be empty.")
@@ -334,4 +569,3 @@ def load_ace_config(filename: str | Path) -> AceApplicationConfig:
         raise ApplicationConfigError("[output].directory cannot be empty.")
     if not sections["execution"]["njoy_executable"].strip():
         raise ApplicationConfigError("[execution].njoy_executable cannot be empty.")
-    return AceApplicationConfig(file_path=source, sections=sections)
