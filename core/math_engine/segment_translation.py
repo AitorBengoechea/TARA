@@ -21,6 +21,7 @@ in meV, matching the existing sampler configuration.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -38,6 +39,149 @@ DEFAULT_ORIGIN_SAFETY_FACTOR = 1.05
 DEFAULT_ORIGIN_MIN_POINTS = 4
 
 _EPS = 1e-14
+
+
+@njit(cache=True)
+def _choose_valley_index(x_grid, y_smooth, first, last, boundary, distance_scale):
+    """Select the lowest-cost valley candidate inside one search window.
+
+    Parameters
+    ----------
+    x_grid, y_smooth : numpy.ndarray
+        Source energies and smoothed density used for valley detection.
+    first, last : int
+        Inclusive bounds of the search window on the grid.
+    boundary : float
+        Nominal boundary in eV.
+    distance_scale : float
+        Energy scale in eV used to normalize distance from the boundary.
+
+    Returns
+    -------
+    int
+        Grid index of the best candidate, preferring the earlier index on ties.
+    """
+    value_min = y_smooth[first]
+    value_max = y_smooth[first]
+    for grid_idx in range(first + 1, last + 1):
+        value = y_smooth[grid_idx]
+        if value < value_min:
+            value_min = value
+        if value > value_max:
+            value_max = value
+
+    value_span = max(value_max - value_min, _EPS)
+    best_index = first
+    best_cost = np.inf
+
+    for grid_idx in range(first, last + 1):
+        amplitude_cost = (
+            (y_smooth[grid_idx] - value_min) / value_span
+        )
+        distance_cost = (
+            abs(x_grid[grid_idx] - boundary) / distance_scale
+        )
+        cost = amplitude_cost + 0.08 * distance_cost
+
+        if grid_idx > first and grid_idx < last:
+            if (
+                y_smooth[grid_idx] <= y_smooth[grid_idx - 1]
+                and y_smooth[grid_idx] <= y_smooth[grid_idx + 1]
+            ):
+                cost -= 0.03
+
+        if cost < best_cost:
+            best_cost = cost
+            best_index = grid_idx
+    return best_index
+
+
+@njit(inline="always")
+def _valley_search_window(x_grid, nominal_boundaries, boundary_idx, search_radius_eV, dx):
+    """Find the grid indices allowed for one valley search.
+
+    Parameters
+    ----------
+    x_grid, nominal_boundaries : numpy.ndarray
+        Source energies and desired internal boundaries in eV.
+    boundary_idx : int
+        Boundary whose search window is being calculated.
+    search_radius_eV, dx : float
+        Maximum search radius and mean grid spacing in eV.
+
+    Returns
+    -------
+    tuple of int
+        Inclusive search indices, or (-1, -1) for an empty window.
+    """
+    n_grid = x_grid.size
+    n_boundaries = nominal_boundaries.size
+    boundary = nominal_boundaries[boundary_idx]
+    if boundary_idx == 0:
+        lower_limit = x_grid[0] + dx
+    else:
+        lower_limit = (
+            0.5
+            * (nominal_boundaries[boundary_idx - 1] + boundary)
+            + dx
+        )
+
+    if boundary_idx == n_boundaries - 1:
+        upper_limit = x_grid[n_grid - 1] - dx
+    else:
+        upper_limit = (
+            0.5
+            * (boundary + nominal_boundaries[boundary_idx + 1])
+            - dx
+        )
+
+    lower = max(boundary - search_radius_eV, lower_limit)
+    upper = min(boundary + search_radius_eV, upper_limit)
+    if upper <= lower:
+        return -1, -1
+
+    first = -1
+    last = -1
+    for grid_idx in range(n_grid):
+        x_value = x_grid[grid_idx]
+        if x_value >= lower and x_value <= upper:
+            if first < 0:
+                first = grid_idx
+            last = grid_idx
+
+    return first, last
+
+
+@njit(inline="always")
+def _enforce_boundary_spacing(effective, x_grid, dx) -> None:
+    """Apply the minimum spacing and source-edge limits in place.
+
+    Parameters
+    ----------
+    effective : numpy.ndarray
+        Selected boundary positions to adjust.
+    x_grid : numpy.ndarray
+        Source energies in eV.
+    dx : float
+        Mean grid spacing in eV.
+    """
+    n_boundaries = effective.size
+    n_grid = x_grid.size
+    minimum_separation = max(dx, _EPS)
+    for boundary_idx in range(1, n_boundaries):
+        minimum_allowed = (
+            effective[boundary_idx - 1] + minimum_separation
+        )
+        if effective[boundary_idx] <= minimum_allowed:
+            effective[boundary_idx] = minimum_allowed
+
+    lower_clip = x_grid[0] + minimum_separation
+    upper_clip = x_grid[n_grid - 1] - minimum_separation
+    for boundary_idx in range(n_boundaries):
+        if effective[boundary_idx] < lower_clip:
+            effective[boundary_idx] = lower_clip
+        elif effective[boundary_idx] > upper_clip:
+            effective[boundary_idx] = upper_clip
 
 
 @njit
@@ -71,98 +215,22 @@ def _snap_boundaries_kernel(
     """
     effective = nominal_boundaries.copy()
     n_boundaries = nominal_boundaries.size
-    n_grid = x_grid.size
 
     for boundary_idx in range(n_boundaries):
         boundary = nominal_boundaries[boundary_idx]
 
-        if boundary_idx == 0:
-            lower_limit = x_grid[0] + dx
-        else:
-            lower_limit = (
-                0.5
-                * (nominal_boundaries[boundary_idx - 1] + boundary)
-                + dx
-            )
-
-        if boundary_idx == n_boundaries - 1:
-            upper_limit = x_grid[n_grid - 1] - dx
-        else:
-            upper_limit = (
-                0.5
-                * (boundary + nominal_boundaries[boundary_idx + 1])
-                - dx
-            )
-
-        lower = max(boundary - search_radius_eV, lower_limit)
-        upper = min(boundary + search_radius_eV, upper_limit)
-        if upper <= lower:
-            continue
-
-        first = -1
-        last = -1
-        for grid_idx in range(n_grid):
-            x_value = x_grid[grid_idx]
-            if x_value >= lower and x_value <= upper:
-                if first < 0:
-                    first = grid_idx
-                last = grid_idx
-
+        first, last = _valley_search_window(
+            x_grid, nominal_boundaries, boundary_idx, search_radius_eV, dx,
+        )
         if first < 0 or last - first + 1 < 3:
             continue
 
-        value_min = y_smooth[first]
-        value_max = y_smooth[first]
-        for grid_idx in range(first + 1, last + 1):
-            value = y_smooth[grid_idx]
-            if value < value_min:
-                value_min = value
-            if value > value_max:
-                value_max = value
-
-        value_span = max(value_max - value_min, _EPS)
-        distance_scale = max(search_radius_eV, dx)
-        best_index = first
-        best_cost = np.inf
-
-        for grid_idx in range(first, last + 1):
-            amplitude_cost = (
-                (y_smooth[grid_idx] - value_min) / value_span
-            )
-            distance_cost = (
-                abs(x_grid[grid_idx] - boundary) / distance_scale
-            )
-            cost = amplitude_cost + 0.08 * distance_cost
-
-            if grid_idx > first and grid_idx < last:
-                if (
-                    y_smooth[grid_idx] <= y_smooth[grid_idx - 1]
-                    and y_smooth[grid_idx] <= y_smooth[grid_idx + 1]
-                ):
-                    cost -= 0.03
-
-            if cost < best_cost:
-                best_cost = cost
-                best_index = grid_idx
-
+        best_index = _choose_valley_index(
+            x_grid, y_smooth, first, last, boundary, max(search_radius_eV, dx),
+        )
         effective[boundary_idx] = x_grid[best_index]
 
-    minimum_separation = max(dx, _EPS)
-    for boundary_idx in range(1, n_boundaries):
-        minimum_allowed = (
-            effective[boundary_idx - 1] + minimum_separation
-        )
-        if effective[boundary_idx] <= minimum_allowed:
-            effective[boundary_idx] = minimum_allowed
-
-    lower_clip = x_grid[0] + minimum_separation
-    upper_clip = x_grid[n_grid - 1] - minimum_separation
-    for boundary_idx in range(n_boundaries):
-        if effective[boundary_idx] < lower_clip:
-            effective[boundary_idx] = lower_clip
-        elif effective[boundary_idx] > upper_clip:
-            effective[boundary_idx] = upper_clip
-
+    _enforce_boundary_spacing(effective, x_grid, dx)
     return effective
 
 
@@ -323,6 +391,36 @@ def _pchip_endpoint_slope(
     return derivative
 
 
+@njit(inline="always")
+def _pchip_interval_slopes(x_nodes, y_nodes, n_nodes):
+    """Compute adjacent node distances and secant slopes.
+
+    Parameters
+    ----------
+    x_nodes, y_nodes : numpy.ndarray
+        Coordinates and values of one trusted node row.
+    n_nodes : int
+        Number of valid nodes in the row.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Interval widths and secant slopes, in interval order.
+    """
+    h = np.empty(n_nodes - 1, dtype=np.float64)
+    slopes = np.empty(n_nodes - 1, dtype=np.float64)
+    for interval_idx in range(n_nodes - 1):
+        h[interval_idx] = (
+            x_nodes[interval_idx + 1] - x_nodes[interval_idx]
+        )
+        slopes[interval_idx] = (
+            (y_nodes[interval_idx + 1] - y_nodes[interval_idx])
+            / h[interval_idx]
+        )
+
+    return h, slopes
+
+
 @njit
 def _pchip_derivatives(
     x_nodes: np.ndarray,
@@ -357,16 +455,7 @@ def _pchip_derivatives(
         derivatives[1] = slope
         return derivatives
 
-    h = np.empty(n_nodes - 1, dtype=np.float64)
-    slopes = np.empty(n_nodes - 1, dtype=np.float64)
-    for interval_idx in range(n_nodes - 1):
-        h[interval_idx] = (
-            x_nodes[interval_idx + 1] - x_nodes[interval_idx]
-        )
-        slopes[interval_idx] = (
-            (y_nodes[interval_idx + 1] - y_nodes[interval_idx])
-            / h[interval_idx]
-        )
+    h, slopes = _pchip_interval_slopes(x_nodes, y_nodes, n_nodes)
 
     for node_idx in range(1, n_nodes - 1):
         left_slope = slopes[node_idx - 1]
@@ -400,6 +489,93 @@ def _pchip_derivatives(
         slopes[n_nodes - 3],
     )
     return derivatives
+
+
+@njit(inline="always")
+def _pchip_interval_value(x_nodes, y_nodes, derivatives, interval_idx, x_value) -> float:
+    """Evaluate the cubic Hermite polynomial on one PCHIP interval.
+
+    Parameters
+    ----------
+    x_nodes, y_nodes, derivatives : numpy.ndarray
+        Trusted node coordinates, values, and PCHIP slopes.
+    interval_idx : int
+        Index of the interval's left node.
+    x_value : float
+        Energy within the interval.
+
+    Returns
+    -------
+    float
+        Interpolated density.
+    """
+    x_left = x_nodes[interval_idx]
+    x_right = x_nodes[interval_idx + 1]
+    h = x_right - x_left
+    t = (x_value - x_left) / h
+    t2 = t * t
+    t3 = t2 * t
+
+    h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+    h10 = t3 - 2.0 * t2 + t
+    h01 = -2.0 * t3 + 3.0 * t2
+    h11 = t3 - t2
+
+    return (
+        h00 * y_nodes[interval_idx]
+        + h10 * h * derivatives[interval_idx]
+        + h01 * y_nodes[interval_idx + 1]
+        + h11 * h * derivatives[interval_idx + 1]
+    )
+
+
+@njit(inline="always")
+def _write_pchip_row(x_nodes, y_nodes, n_nodes, derivatives, x_output, non_negative, output) -> None:
+    """Evaluate one PCHIP row without extrapolating beyond the trusted nodes.
+
+    Parameters
+    ----------
+    x_nodes, y_nodes : numpy.ndarray
+        Trusted coordinates and values for one sample.
+    n_nodes : int
+        Number of valid nodes.
+    derivatives : numpy.ndarray
+        Shape-preserving derivative at each valid node.
+    x_output : numpy.ndarray
+        Shared target energy grid.
+    non_negative : bool
+        Clamp negative interpolated values to zero when True.
+    output : numpy.ndarray
+        Zero-initialized output row.
+    """
+    n_output = x_output.size
+    interval_idx = 0
+
+    for output_idx in range(n_output):
+        x_value = x_output[output_idx]
+        if (
+            x_value < x_nodes[0]
+            or x_value > x_nodes[n_nodes - 1]
+        ):
+            continue
+
+        if x_value == x_nodes[n_nodes - 1]:
+            value = y_nodes[n_nodes - 1]
+        else:
+            while (
+                interval_idx + 1 < n_nodes
+                and x_nodes[interval_idx + 1] < x_value
+            ):
+                interval_idx += 1
+
+            if interval_idx + 1 >= n_nodes:
+                value = y_nodes[n_nodes - 1]
+            else:
+                value = _pchip_interval_value(x_nodes, y_nodes, derivatives, interval_idx, x_value)
+
+        if non_negative and value < 0.0:
+            value = 0.0
+        output[output_idx] = value
 
 
 @njit(parallel=True)
@@ -440,50 +616,10 @@ def _pchip_interpolate_rows(
             y_nodes[sample_idx],
             n_nodes,
         )
-        interval_idx = 0
-
-        for output_idx in range(n_output):
-            x_value = x_output[output_idx]
-            if (
-                x_value < x_nodes[sample_idx, 0]
-                or x_value > x_nodes[sample_idx, n_nodes - 1]
-            ):
-                continue
-
-            if x_value == x_nodes[sample_idx, n_nodes - 1]:
-                value = y_nodes[sample_idx, n_nodes - 1]
-            else:
-                while (
-                    interval_idx + 1 < n_nodes
-                    and x_nodes[sample_idx, interval_idx + 1] < x_value
-                ):
-                    interval_idx += 1
-
-                if interval_idx + 1 >= n_nodes:
-                    value = y_nodes[sample_idx, n_nodes - 1]
-                else:
-                    x_left = x_nodes[sample_idx, interval_idx]
-                    x_right = x_nodes[sample_idx, interval_idx + 1]
-                    h = x_right - x_left
-                    t = (x_value - x_left) / h
-                    t2 = t * t
-                    t3 = t2 * t
-
-                    h00 = 2.0 * t3 - 3.0 * t2 + 1.0
-                    h10 = t3 - 2.0 * t2 + t
-                    h01 = -2.0 * t3 + 3.0 * t2
-                    h11 = t3 - t2
-
-                    value = (
-                        h00 * y_nodes[sample_idx, interval_idx]
-                        + h10 * h * derivatives[interval_idx]
-                        + h01 * y_nodes[sample_idx, interval_idx + 1]
-                        + h11 * h * derivatives[interval_idx + 1]
-                    )
-
-            if non_negative[sample_idx] and value < 0.0:
-                value = 0.0
-            output[sample_idx, output_idx] = value
+        _write_pchip_row(
+            x_nodes[sample_idx], y_nodes[sample_idx], n_nodes, derivatives,
+            x_output, non_negative[sample_idx], output[sample_idx],
+        )
 
     return output
 
@@ -531,12 +667,9 @@ class TranslationDiagnostics:
         Effective source ranges after valley snapping.
     """
 
-    # Domain boundaries and reconstruction guards.
     nominal_boundaries: np.ndarray
     effective_boundaries: np.ndarray
     reconstruction_guard_widths: np.ndarray
-
-    # Segment shifts and ranges.
     segment_shifts_eV: np.ndarray
     segment_ranges: Tuple[Tuple[float, float], ...]
 
@@ -665,6 +798,47 @@ def _extend_output_grid_right(
     return np.concatenate([x_grid, extra])
 
 
+def _merge_covering_segments(segments, tolerance):
+    """Coalesce neighboring source segments with the same translation.
+
+    Parameters
+    ----------
+    segments : sequence of _Segment
+        Covering source intervals in energy order.
+    tolerance : float
+        Endpoint tolerance in eV.
+
+    Returns
+    -------
+    list of _Segment
+        Covering intervals after coalescing equal shifts.
+    """
+    # Merge adjacent segments carrying the same translation.
+    merged: List[_Segment] = []
+
+    for segment in segments:
+        if (
+            merged
+            and abs(merged[-1].shift_eV - segment.shift_eV) <= _EPS
+            and abs(merged[-1].end - segment.start) <= tolerance
+        ):
+            previous = merged[-1]
+            merged[-1] = _Segment(
+                start=previous.start,
+                end=segment.end,
+                shift_eV=previous.shift_eV,
+                source_index=(
+                    previous.source_index
+                    if previous.source_index == segment.source_index
+                    else None
+                ),
+            )
+        else:
+            merged.append(segment)
+
+    return merged
+
+
 def _build_covering_segments(
     x_min: float,
     x_max: float,
@@ -768,30 +942,7 @@ def _build_covering_segments(
             )
         ]
 
-    # Merge adjacent segments carrying the same translation.
-    merged: List[_Segment] = []
-
-    for segment in segments:
-        if (
-            merged
-            and abs(merged[-1].shift_eV - segment.shift_eV) <= _EPS
-            and abs(merged[-1].end - segment.start) <= tolerance
-        ):
-            previous = merged[-1]
-            merged[-1] = _Segment(
-                start=previous.start,
-                end=segment.end,
-                shift_eV=previous.shift_eV,
-                source_index=(
-                    previous.source_index
-                    if previous.source_index == segment.source_index
-                    else None
-                ),
-            )
-        else:
-            merged.append(segment)
-
-    return merged
+    return _merge_covering_segments(segments, tolerance)
 
 
 def _gaussian_smooth(
@@ -1073,6 +1224,54 @@ def _origin_anchored_coordinates(
     return x_mapped
 
 
+def _trusted_source_indices(x_grid, start, end, i, n_segments, guards):
+    """Select source nodes after trimming the reconstruction guards.
+
+    Parameters
+    ----------
+    x_grid : numpy.ndarray
+        Original energy grid in eV.
+    start, end : float
+        Source segment bounds in eV.
+    i, n_segments : int
+        Segment index and total number of segments.
+    guards : numpy.ndarray
+        Guard widths in eV at the internal boundaries.
+
+    Returns
+    -------
+    numpy.ndarray
+        Source indices inside the trusted region or the fallback core.
+    """
+    lower = start
+    upper = end
+
+    if i > 0:
+        lower += guards[i - 1]
+
+    if i < n_segments - 1:
+        upper -= guards[i]
+
+    mask = (x_grid >= lower) & (x_grid <= upper)
+    indices = np.flatnonzero(mask)
+
+    # Narrow domains can lose most points when neighboring shifts differ.
+    # Keep the deepest available core rather than mixing shifted copies.
+    if indices.size < 2:
+        midpoint = 0.5 * (start + end)
+        center = int(np.argmin(np.abs(x_grid - midpoint)))
+        lo = max(0, center - 1)
+        hi = min(x_grid.size, center + 2)
+        indices = np.arange(lo, hi)
+
+        inside = (
+            (x_grid[indices] >= start)
+            & (x_grid[indices] <= end)
+        )
+        indices = indices[inside]
+    return indices
+
+
 def _build_trusted_segment_samples(
     x_grid: np.ndarray,
     y_density: np.ndarray,
@@ -1110,32 +1309,9 @@ def _build_trusted_segment_samples(
     for i, ((start, end), shift_eV) in enumerate(
         zip(segment_ranges, segment_shifts_eV)
     ):
-        lower = start
-        upper = end
-
-        if i > 0:
-            lower += reconstruction_guards[i - 1]
-
-        if i < len(segment_ranges) - 1:
-            upper -= reconstruction_guards[i]
-
-        mask = (x_grid >= lower) & (x_grid <= upper)
-        indices = np.flatnonzero(mask)
-
-        # Narrow domains can lose most points when neighboring shifts differ.
-        # Keep the deepest available core rather than mixing shifted copies.
-        if indices.size < 2:
-            midpoint = 0.5 * (start + end)
-            center = int(np.argmin(np.abs(x_grid - midpoint)))
-            lo = max(0, center - 1)
-            hi = min(x_grid.size, center + 2)
-            indices = np.arange(lo, hi)
-
-            inside = (
-                (x_grid[indices] >= start)
-                & (x_grid[indices] <= end)
-            )
-            indices = indices[inside]
+        indices = _trusted_source_indices(
+            x_grid, start, end, i, len(segment_ranges), reconstruction_guards,
+        )
 
         if indices.size == 0:
             translated_segments.append(
@@ -1353,6 +1529,45 @@ def _reconstruct_single_spectrum(
     return y_output
 
 
+def _trusted_segment_masks(x_grid, segment_ranges, reconstruction_guards):
+    """Mark trusted source coordinates for each segment after guard trimming.
+
+    Parameters
+    ----------
+    x_grid : numpy.ndarray
+        Original energy grid in eV.
+    segment_ranges : sequence of tuple of float
+        Source-energy intervals in eV.
+    reconstruction_guards : numpy.ndarray
+        Guard half-widths at the internal boundaries in eV.
+
+    Returns
+    -------
+    numpy.ndarray
+        Segment-by-grid mask with 1 at trusted coordinates and 0 elsewhere.
+    """
+    trusted_masks = np.zeros(
+        (len(segment_ranges), x_grid.size),
+        dtype=float,
+    )
+
+    for i, (start, end) in enumerate(segment_ranges):
+        lower = start
+        upper = end
+
+        if i > 0:
+            lower += reconstruction_guards[i - 1]
+
+        if i < len(segment_ranges) - 1:
+            upper -= reconstruction_guards[i]
+
+        trusted_masks[i] = (
+            (x_grid >= lower)
+            & (x_grid <= upper)
+        ).astype(float)
+    return trusted_masks
+
+
 def build_translation_plan(
     x_grid: np.ndarray,
     y_density: np.ndarray,
@@ -1476,25 +1691,7 @@ def build_translation_plan(
         ),
     )
 
-    trusted_masks = np.zeros(
-        (len(segment_ranges), x_grid.size),
-        dtype=float,
-    )
-
-    for i, (start, end) in enumerate(segment_ranges):
-        lower = start
-        upper = end
-
-        if i > 0:
-            lower += reconstruction_guards[i - 1]
-
-        if i < len(segment_ranges) - 1:
-            upper -= reconstruction_guards[i]
-
-        trusted_masks[i] = (
-            (x_grid >= lower)
-            & (x_grid <= upper)
-        ).astype(float)
+    trusted_masks = _trusted_segment_masks(x_grid, segment_ranges, reconstruction_guards)
 
     diagnostics = TranslationDiagnostics(
         nominal_boundaries=nominal_boundaries,
@@ -1505,6 +1702,141 @@ def build_translation_plan(
     )
 
     return segments, trusted_masks, diagnostics
+
+
+def _translated_trusted_nodes(x_grid, y_density, diagnostics, *, freeze_origin):
+    """Translate, trim, and merge the trusted reconstruction nodes.
+
+    Parameters
+    ----------
+    x_grid, y_density : numpy.ndarray
+        Input grid in eV and corresponding density.
+    diagnostics : TranslationDiagnostics
+        Effective segment geometry, shifts, and guards.
+    freeze_origin : bool
+        Whether the first point retains its original coordinate.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Monotonic reconstruction nodes and their density values.
+    """
+    segment_shifts_eV = diagnostics.segment_shifts_eV
+
+    translated_segments = _build_trusted_segment_samples(
+        x_grid=x_grid,
+        y_density=y_density,
+        segment_ranges=diagnostics.segment_ranges,
+        segment_shifts_eV=segment_shifts_eV,
+        reconstruction_guards=diagnostics.reconstruction_guard_widths,
+        freeze_origin=freeze_origin,
+    )
+
+    translated_segments = _trim_translated_overlaps(
+        translated_segments=translated_segments,
+    )
+
+    x_nodes, y_nodes = _merge_trusted_samples(
+        translated_segments=translated_segments,
+        x_grid=x_grid,
+        y_density=y_density,
+        freeze_origin=freeze_origin,
+    )
+    return x_nodes, y_nodes
+
+
+def _finalize_scalar_density(x_grid, y_density, x_output, y_output, freeze_origin, preserve_area) -> None:
+    """Apply the origin guard and optional area correction in place.
+
+    Parameters
+    ----------
+    x_grid, y_density : numpy.ndarray
+        Original energies and density.
+    x_output, y_output : numpy.ndarray
+        Reconstructed energies and density.
+    freeze_origin : bool
+        Retain the original first density value.
+    preserve_area : bool
+        Apply the existing integral-based density rescaling when True.
+    """
+    if freeze_origin:
+        # The first node is part of the anchored coordinate map itself.
+        # This assignment is only a roundoff guard, not the anchoring mechanism.
+        y_output[0] = y_density[0]
+
+    if preserve_area:
+        # Integrate against the physical coordinate grid, accounting for nonuniform spacing.
+        area_old = float(np.trapezoid(y_density, x_grid))
+        # Integrate against the physical coordinate grid, accounting for nonuniform spacing.
+        area_new = float(np.trapezoid(y_output, x_output))
+
+        if abs(area_new) > _EPS:
+            scale = area_old / area_new
+
+            if freeze_origin:
+                # Keep the first point anchored after global area correction.
+                y_output[1:] *= scale
+                y_output[0] = y_density[0]
+            else:
+                y_output *= scale
+
+
+def _reconstruct_translated_spectrum(
+    x_grid, y_density, x_nodes, y_nodes, freeze_origin, preserve_area,
+):
+    """Reconstruct and validate one spectrum from its translated nodes.
+
+    Parameters
+    ----------
+    x_grid, y_density : numpy.ndarray
+        Original energy grid in eV and density.
+    x_nodes, y_nodes : numpy.ndarray
+        Monotonic reconstruction coordinates and trusted density values.
+    freeze_origin, preserve_area : bool
+        Apply the origin guard and the integral correction, respectively.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Physical energy grid in eV and reconstructed density.
+
+    Raises
+    ------
+    RuntimeError
+        If the output grid contains negative energies or the density is nonfinite.
+    """
+    # Extend only as far as trusted translated support requires.
+    extension_eV = max(
+        0.0,
+        float(x_nodes[-1] - x_grid[-1]),
+    )
+    x_output = _extend_output_grid_right(
+        x_grid=x_grid,
+        extension_eV=extension_eV,
+    )
+
+    y_output = _reconstruct_single_spectrum(
+        x_nodes=x_nodes,
+        y_nodes=y_nodes,
+        x_output=x_output,
+        non_negative=bool(np.all(y_density >= -1e-15)),
+    )
+
+    _finalize_scalar_density(
+        x_grid, y_density, x_output, y_output, freeze_origin, preserve_area,
+    )
+
+    if np.any(x_output < 0.0):
+        raise RuntimeError(
+            "Internal error: reconstructed energy grid contains negative values."
+        )
+
+    if not np.all(np.isfinite(y_output)):
+        raise RuntimeError(
+            "Internal error: reconstruction produced non-finite density values."
+        )
+
+    return x_output, y_output
 
 
 def apply_spatial_warp(
@@ -1599,7 +1931,7 @@ def apply_spatial_warp(
     if shifts.size == 0 or np.all(np.abs(shifts) < 1e-12):
         return x_grid.copy(), y_density.copy()
 
-    segments, _, diagnostics = build_translation_plan(
+    _, _, diagnostics = build_translation_plan(
         x_grid=x_grid,
         y_density=y_density,
         boundaries=boundaries,
@@ -1612,77 +1944,13 @@ def apply_spatial_warp(
         min_guard_points=min_guard_points,
     )
 
-    segment_shifts_eV = diagnostics.segment_shifts_eV
-
-    translated_segments = _build_trusted_segment_samples(
-        x_grid=x_grid,
-        y_density=y_density,
-        segment_ranges=diagnostics.segment_ranges,
-        segment_shifts_eV=segment_shifts_eV,
-        reconstruction_guards=diagnostics.reconstruction_guard_widths,
-        freeze_origin=freeze_origin,
+    x_nodes, y_nodes = _translated_trusted_nodes(
+        x_grid, y_density, diagnostics, freeze_origin=freeze_origin,
     )
 
-    translated_segments = _trim_translated_overlaps(
-        translated_segments=translated_segments,
+    return _reconstruct_translated_spectrum(
+        x_grid, y_density, x_nodes, y_nodes, freeze_origin, preserve_area,
     )
-
-    x_nodes, y_nodes = _merge_trusted_samples(
-        translated_segments=translated_segments,
-        x_grid=x_grid,
-        y_density=y_density,
-        freeze_origin=freeze_origin,
-    )
-
-    # Extend only as far as trusted translated support requires.
-    extension_eV = max(
-        0.0,
-        float(x_nodes[-1] - x_grid[-1]),
-    )
-    x_output = _extend_output_grid_right(
-        x_grid=x_grid,
-        extension_eV=extension_eV,
-    )
-
-    y_output = _reconstruct_single_spectrum(
-        x_nodes=x_nodes,
-        y_nodes=y_nodes,
-        x_output=x_output,
-        non_negative=bool(np.all(y_density >= -1e-15)),
-    )
-
-    if freeze_origin:
-        # The first node is part of the anchored coordinate map itself.
-        # This assignment is only a roundoff guard, not the anchoring mechanism.
-        y_output[0] = y_density[0]
-
-    if preserve_area:
-        # Integrate against the physical coordinate grid, accounting for nonuniform spacing.
-        area_old = float(np.trapezoid(y_density, x_grid))
-        # Integrate against the physical coordinate grid, accounting for nonuniform spacing.
-        area_new = float(np.trapezoid(y_output, x_output))
-
-        if abs(area_new) > _EPS:
-            scale = area_old / area_new
-
-            if freeze_origin:
-                # Keep the first point anchored after global area correction.
-                y_output[1:] *= scale
-                y_output[0] = y_density[0]
-            else:
-                y_output *= scale
-
-    if np.any(x_output < 0.0):
-        raise RuntimeError(
-            "Internal error: reconstructed energy grid contains negative values."
-        )
-
-    if not np.all(np.isfinite(y_output)):
-        raise RuntimeError(
-            "Internal error: reconstruction produced non-finite density values."
-        )
-
-    return x_output, y_output
 
 
 def _self_test() -> None:
@@ -1826,6 +2094,224 @@ if __name__ == "__main__":
     _self_test()
 
 
+def _pack_trusted_nodes(node_sets, max_nodes):
+    """Pack ragged node arrays for the compiled row interpolator.
+
+    Parameters
+    ----------
+    node_sets : sequence of tuple of numpy.ndarray
+        Trusted energy and density arrays for each sample.
+    max_nodes : int
+        Largest number of trusted nodes in a sample.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Energy and density matrices and valid node counts per row.
+    """
+    n_samples = len(node_sets)
+    # Pack ragged trusted nodes once, then reconstruct every spectrum in one
+    # parallel compiled call. This removes the per-sample SciPy PCHIP object
+    # construction/evaluation from the batch hot path.
+    x_nodes_matrix = np.empty((n_samples, max_nodes), dtype=np.float64)
+    y_nodes_matrix = np.empty((n_samples, max_nodes), dtype=np.float64)
+    node_lengths = np.empty(n_samples, dtype=np.int64)
+
+    for sample_idx, (x_nodes, y_nodes) in enumerate(node_sets):
+        n_nodes = x_nodes.size
+        node_lengths[sample_idx] = n_nodes
+        x_nodes_matrix[sample_idx, :n_nodes] = x_nodes
+        y_nodes_matrix[sample_idx, :n_nodes] = y_nodes
+    return x_nodes_matrix, y_nodes_matrix, node_lengths
+
+
+def _resolve_translation_output_grid(x_grid, output_grid, max_sample_length, dx):
+    """Allocate or validate the common energy grid for a translated batch.
+
+    Parameters
+    ----------
+    x_grid : numpy.ndarray
+        Base energy grid in eV.
+    output_grid : numpy.ndarray or None
+        Optional capacity grid supplied by the caller.
+    max_sample_length : int
+        Largest required valid prefix length.
+    dx : float
+        Mean grid spacing used for extension, in eV.
+
+    Returns
+    -------
+    numpy.ndarray
+        Common output grid for all reconstructions.
+
+    Raises
+    ------
+    ValueError
+        If the supplied grid does not preserve the baseline prefix or lacks capacity.
+    """
+    if output_grid is None:
+        n_extra = max_sample_length - x_grid.size
+        if n_extra > 0:
+            extra = x_grid[-1] + np.arange(
+                1, n_extra + 1, dtype=np.float64
+            ) * dx
+            # Append points while preserving the original grid as the prefix.
+            output_grid = np.concatenate((x_grid, extra))
+        else:
+            output_grid = x_grid.copy()
+    else:
+        output_grid = np.asarray(output_grid, dtype=np.float64)
+        if output_grid.ndim != 1 or output_grid.size < x_grid.size:
+            raise ValueError(
+                "output_grid must be one-dimensional and contain the base grid."
+            )
+        if not np.allclose(
+            output_grid[: x_grid.size],
+            x_grid,
+            rtol=1e-10,
+            atol=1e-12,
+        ):
+            raise ValueError(
+                "output_grid must preserve the baseline grid prefix."
+            )
+        if max_sample_length > output_grid.size:
+            raise ValueError(
+                "output_grid is too short for a translated batch sample."
+            )
+    return output_grid
+
+
+def _validate_translation_batch(x_grid, y_density, shifts, boundaries) -> None:
+    """Validate the dimensions of the grid, densities, and translation shifts.
+
+    Parameters
+    ----------
+    x_grid, y_density : numpy.ndarray
+        Source grid and one density row per sample.
+    shifts : numpy.ndarray
+        Translation in meV for each sample and domain.
+    boundaries : sequence of tuple of float
+        Energy bounds for the domains.
+    """
+    if x_grid.ndim != 1:
+        raise ValueError("x_grid must be one-dimensional.")
+    if y_density.ndim != 2 or y_density.shape[1] != x_grid.size:
+        raise ValueError(
+            "y_density must have shape (n_samples, len(x_grid))."
+        )
+    if shifts.ndim != 2 or shifts.shape[0] != y_density.shape[0]:
+        raise ValueError(
+            "shifts must be two-dimensional with one row per density sample."
+        )
+    if shifts.shape[1] != len(boundaries):
+        raise ValueError(
+            "The number of spatial-shift columns must match the number of domains."
+        )
+
+
+def _plan_translation_rows(x_grid, y_density, shifts, dx, plan, freeze_origin):
+    """Build trusted reconstruction nodes and record each sample's output support.
+
+    Parameters
+    ----------
+    x_grid, y_density : numpy.ndarray
+        Base energy coordinates in eV and sample density rows.
+    shifts : numpy.ndarray
+        Sample-by-domain translations in meV.
+    dx : float
+        Mean spacing in eV used to extend the base grid.
+    plan : callable
+        Translation plan builder configured with the shared domain options.
+    freeze_origin : bool
+        Keep the first original coordinate anchored.
+
+    Returns
+    -------
+    tuple
+        Pairs of trusted node arrays, output lengths, maximum node count,
+        and maximum output length.
+    """
+    n_samples = y_density.shape[0]
+    sample_lengths = np.empty(n_samples, dtype=np.int64)
+    node_sets = []
+    max_nodes = 0
+    max_sample_length = x_grid.size
+
+    # Geometry remains sample dependent because valley locations depend on the
+    # amplitude-modified spectrum. Build only the trusted node sets in Python;
+    # the expensive cubic reconstruction of all rows is delegated to one
+    # parallel Numba kernel below.
+    for sample_idx in range(n_samples):
+        sample_shifts = shifts[sample_idx]
+
+        if sample_shifts.size == 0 or np.all(np.abs(sample_shifts) < 1e-12):
+            x_nodes = x_grid.copy()
+            y_nodes = y_density[sample_idx].copy()
+        else:
+            _, _, diagnostics = plan(
+                y_density=y_density[sample_idx], shifts=sample_shifts,
+            )
+            x_nodes, y_nodes = _translated_trusted_nodes(
+                x_grid, y_density[sample_idx], diagnostics, freeze_origin=freeze_origin,
+            )
+
+        extension_eV = max(0.0, float(x_nodes[-1] - x_grid[-1]))
+        if extension_eV > 0.0:
+            n_extra = int(np.ceil(extension_eV / dx)) + 2
+        else:
+            n_extra = 0
+
+        sample_length = x_grid.size + n_extra
+        sample_lengths[sample_idx] = sample_length
+        max_sample_length = max(max_sample_length, sample_length)
+        max_nodes = max(max_nodes, x_nodes.size)
+        node_sets.append((x_nodes, y_nodes))
+
+    return node_sets, sample_lengths, max_nodes, max_sample_length
+
+
+def _finalize_batch_density(
+    x_grid, y_density, output_grid, density_matrix, sample_lengths,
+    freeze_origin, preserve_area,
+) -> None:
+    """Apply the density corrections and zero-fill beyond each sample's support.
+
+    Parameters
+    ----------
+    x_grid, y_density : numpy.ndarray
+        Original energy coordinates and density rows.
+    output_grid, density_matrix : numpy.ndarray
+        Shared output grid and reconstructed density rows updated in place.
+    sample_lengths : numpy.ndarray
+        Valid grid prefix length of each row.
+    freeze_origin : bool
+        Retain the original first density value per row.
+    preserve_area : bool
+        Apply the existing integral-based density rescaling when True.
+    """
+    n_samples = y_density.shape[0]
+    if freeze_origin:
+        density_matrix[:, 0] = y_density[:, 0]
+
+    if preserve_area:
+        # Integrate against the physical coordinate grid, accounting for nonuniform spacing.
+        area_old = np.trapezoid(y_density, x_grid, axis=1)
+        # Integrate against the physical coordinate grid, accounting for nonuniform spacing.
+        area_new = np.trapezoid(density_matrix, output_grid, axis=1)
+        valid_area = np.abs(area_new) > _EPS
+        scale = np.ones(n_samples, dtype=np.float64)
+        scale[valid_area] = area_old[valid_area] / area_new[valid_area]
+
+        if freeze_origin:
+            density_matrix[:, 1:] *= scale[:, None]
+            density_matrix[:, 0] = y_density[:, 0]
+        else:
+            density_matrix *= scale[:, None]
+
+    columns = np.arange(output_grid.size)[None, :]
+    density_matrix[columns >= sample_lengths[:, None]] = 0.0
+
+
 def apply_spatial_warp_batch(
     x_grid: np.ndarray,
     y_density: np.ndarray,
@@ -1900,124 +2386,27 @@ def apply_spatial_warp_batch(
     y_density = np.asarray(y_density, dtype=np.float64)
     shifts = np.asarray(shifts, dtype=np.float64)
 
-    if x_grid.ndim != 1:
-        raise ValueError("x_grid must be one-dimensional.")
-    if y_density.ndim != 2 or y_density.shape[1] != x_grid.size:
-        raise ValueError(
-            "y_density must have shape (n_samples, len(x_grid))."
-        )
-    if shifts.ndim != 2 or shifts.shape[0] != y_density.shape[0]:
-        raise ValueError(
-            "shifts must be two-dimensional with one row per density sample."
-        )
-    if shifts.shape[1] != len(boundaries):
-        raise ValueError(
-            "The number of spatial-shift columns must match the number of domains."
-        )
+    _validate_translation_batch(x_grid, y_density, shifts, boundaries)
 
-    n_samples = y_density.shape[0]
+    plan = partial(
+        build_translation_plan,
+        x_grid=x_grid,
+        boundaries=boundaries,
+        snap_boundaries_to_valleys=snap_boundaries_to_valleys,
+        valley_search_radius_meV=valley_search_radius_meV,
+        valley_smoothing_meV=valley_smoothing_meV,
+        reconstruction_guard_meV=reconstruction_guard_meV,
+        shift_guard_factor=shift_guard_factor,
+        min_guard_points=min_guard_points,
+    )
     dx = abs(_mean_dx(x_grid))
-    sample_lengths = np.empty(n_samples, dtype=np.int64)
-    node_sets = []
-    max_nodes = 0
-    max_sample_length = x_grid.size
+    node_sets, sample_lengths, max_nodes, max_sample_length = _plan_translation_rows(
+        x_grid, y_density, shifts, dx, plan, freeze_origin,
+    )
 
-    # Geometry remains sample dependent because valley locations depend on the
-    # amplitude-modified spectrum. Build only the trusted node sets in Python;
-    # the expensive cubic reconstruction of all rows is delegated to one
-    # parallel Numba kernel below.
-    for sample_idx in range(n_samples):
-        sample_shifts = shifts[sample_idx]
+    output_grid = _resolve_translation_output_grid(x_grid, output_grid, max_sample_length, dx)
 
-        if sample_shifts.size == 0 or np.all(np.abs(sample_shifts) < 1e-12):
-            x_nodes = x_grid.copy()
-            y_nodes = y_density[sample_idx].copy()
-        else:
-            segments, _, diagnostics = build_translation_plan(
-                x_grid=x_grid,
-                y_density=y_density[sample_idx],
-                boundaries=boundaries,
-                shifts=sample_shifts,
-                snap_boundaries_to_valleys=snap_boundaries_to_valleys,
-                valley_search_radius_meV=valley_search_radius_meV,
-                valley_smoothing_meV=valley_smoothing_meV,
-                reconstruction_guard_meV=reconstruction_guard_meV,
-                shift_guard_factor=shift_guard_factor,
-                min_guard_points=min_guard_points,
-            )
-
-            translated_segments = _build_trusted_segment_samples(
-                x_grid=x_grid,
-                y_density=y_density[sample_idx],
-                segment_ranges=diagnostics.segment_ranges,
-                segment_shifts_eV=diagnostics.segment_shifts_eV,
-                reconstruction_guards=diagnostics.reconstruction_guard_widths,
-                freeze_origin=freeze_origin,
-            )
-            translated_segments = _trim_translated_overlaps(
-                translated_segments=translated_segments,
-            )
-            x_nodes, y_nodes = _merge_trusted_samples(
-                translated_segments=translated_segments,
-                x_grid=x_grid,
-                y_density=y_density[sample_idx],
-                freeze_origin=freeze_origin,
-            )
-
-        extension_eV = max(0.0, float(x_nodes[-1] - x_grid[-1]))
-        if extension_eV > 0.0:
-            n_extra = int(np.ceil(extension_eV / dx)) + 2
-        else:
-            n_extra = 0
-
-        sample_length = x_grid.size + n_extra
-        sample_lengths[sample_idx] = sample_length
-        max_sample_length = max(max_sample_length, sample_length)
-        max_nodes = max(max_nodes, x_nodes.size)
-        node_sets.append((x_nodes, y_nodes))
-
-    if output_grid is None:
-        n_extra = max_sample_length - x_grid.size
-        if n_extra > 0:
-            extra = x_grid[-1] + np.arange(
-                1, n_extra + 1, dtype=np.float64
-            ) * dx
-            # Assemble the grid segments in the order required by the reconstruction.
-            output_grid = np.concatenate((x_grid, extra))
-        else:
-            output_grid = x_grid.copy()
-    else:
-        output_grid = np.asarray(output_grid, dtype=np.float64)
-        if output_grid.ndim != 1 or output_grid.size < x_grid.size:
-            raise ValueError(
-                "output_grid must be one-dimensional and contain the base grid."
-            )
-        if not np.allclose(
-            output_grid[: x_grid.size],
-            x_grid,
-            rtol=1e-10,
-            atol=1e-12,
-        ):
-            raise ValueError(
-                "output_grid must preserve the baseline grid prefix."
-            )
-        if max_sample_length > output_grid.size:
-            raise ValueError(
-                "output_grid is too short for a translated batch sample."
-            )
-
-    # Pack ragged trusted nodes once, then reconstruct every spectrum in one
-    # parallel compiled call. This removes the per-sample SciPy PCHIP object
-    # construction/evaluation from the batch hot path.
-    x_nodes_matrix = np.empty((n_samples, max_nodes), dtype=np.float64)
-    y_nodes_matrix = np.empty((n_samples, max_nodes), dtype=np.float64)
-    node_lengths = np.empty(n_samples, dtype=np.int64)
-
-    for sample_idx, (x_nodes, y_nodes) in enumerate(node_sets):
-        n_nodes = x_nodes.size
-        node_lengths[sample_idx] = n_nodes
-        x_nodes_matrix[sample_idx, :n_nodes] = x_nodes
-        y_nodes_matrix[sample_idx, :n_nodes] = y_nodes
+    x_nodes_matrix, y_nodes_matrix, node_lengths = _pack_trusted_nodes(node_sets, max_nodes)
 
     non_negative = np.all(y_density >= -1e-15, axis=1)
     density_matrix = _pchip_interpolate_rows(
@@ -2028,26 +2417,10 @@ def apply_spatial_warp_batch(
         non_negative=non_negative,
     )
 
-    if freeze_origin:
-        density_matrix[:, 0] = y_density[:, 0]
-
-    if preserve_area:
-        # Integrate against the physical coordinate grid, accounting for nonuniform spacing.
-        area_old = np.trapezoid(y_density, x_grid, axis=1)
-        # Integrate against the physical coordinate grid, accounting for nonuniform spacing.
-        area_new = np.trapezoid(density_matrix, output_grid, axis=1)
-        valid_area = np.abs(area_new) > _EPS
-        scale = np.ones(n_samples, dtype=np.float64)
-        scale[valid_area] = area_old[valid_area] / area_new[valid_area]
-
-        if freeze_origin:
-            density_matrix[:, 1:] *= scale[:, None]
-            density_matrix[:, 0] = y_density[:, 0]
-        else:
-            density_matrix *= scale[:, None]
-
-    columns = np.arange(output_grid.size)[None, :]
-    density_matrix[columns >= sample_lengths[:, None]] = 0.0
+    _finalize_batch_density(
+        x_grid, y_density, output_grid, density_matrix,
+        sample_lengths, freeze_origin, preserve_area,
+    )
 
     if not np.all(np.isfinite(density_matrix)):
         raise RuntimeError(

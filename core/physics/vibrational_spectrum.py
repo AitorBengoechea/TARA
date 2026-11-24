@@ -73,26 +73,73 @@ def _resolve_uniform_grid(
         zero, or fails to cover the continuum support.
     """
     if energy_grid is None:
-        delta = float(source[1] - source[0])
-        if not np.allclose(np.diff(source), delta, rtol=1e-8, atol=1e-12):
-            raise ValueError(
-                "Provide a uniform energy_grid for nonuniform source data."
-            )
-        active = [m.energy_ev for m in modes if m.weight > 0]
-        if active:
-            # Resolve each Gaussian and keep mode centers above zero.
-            subdiv = int(np.ceil(delta / min(active)))
-            if oscillator_sigma_ev > 0.0:
-                subdiv = max(
-                    subdiv, int(np.ceil(3.0 * delta / oscillator_sigma_ev))
-                )
-            delta /= max(1, subdiv)
-        margin = max(2.0 * delta, _GAUSSIAN_MARGIN_SIGMAS * oscillator_sigma_ev) if active else 0.0
-        upper = max(float(source[-1]), max(active, default=0.0) + margin)
-        grid = np.arange(int(np.ceil(upper / delta)) + 1, dtype=float) * delta
+        grid = _build_uniform_grid(source, modes, oscillator_sigma_ev)
     else:
         grid = np.asarray(energy_grid, dtype=float)
+    _validate_uniform_grid(grid, source_end=source[-1])
+    return grid
 
+
+def _build_uniform_grid(
+    source: np.ndarray,
+    modes: Sequence[DiscreteOscillator],
+    oscillator_sigma_ev: float,
+) -> np.ndarray:
+    """Construct a zero-origin grid that resolves the continuum and modes.
+
+    Parameters
+    ----------
+    source : numpy.ndarray
+        Source continuum energy coordinates in eV.
+    modes : sequence of DiscreteOscillator
+        Modes whose positive weights require support on the grid.
+    oscillator_sigma_ev : float
+        Oscillator broadening standard deviation in eV.
+
+    Returns
+    -------
+    numpy.ndarray
+        Uniform energy grid in eV.
+
+    Raises
+    ------
+    ValueError
+        If the source spacing is nonuniform.
+    """
+    delta = float(source[1] - source[0])
+    if not np.allclose(np.diff(source), delta, rtol=1e-8, atol=1e-12):
+        raise ValueError(
+            "Provide a uniform energy_grid for nonuniform source data."
+        )
+    active = [m.energy_ev for m in modes if m.weight > 0]
+    if active:
+        # Resolve each Gaussian and keep mode centers above zero.
+        subdiv = int(np.ceil(delta / min(active)))
+        if oscillator_sigma_ev > 0.0:
+            subdiv = max(
+                subdiv, int(np.ceil(3.0 * delta / oscillator_sigma_ev))
+            )
+        delta /= max(1, subdiv)
+    margin = max(2.0 * delta, _GAUSSIAN_MARGIN_SIGMAS * oscillator_sigma_ev) if active else 0.0
+    upper = max(float(source[-1]), max(active, default=0.0) + margin)
+    return np.arange(int(np.ceil(upper / delta)) + 1, dtype=float) * delta
+
+
+def _validate_uniform_grid(grid: np.ndarray, source_end: float) -> None:
+    """Validate the shared energy grid and its continuum coverage.
+
+    Parameters
+    ----------
+    grid : numpy.ndarray
+        Candidate uniform energy grid in eV.
+    source_end : float
+        Upper endpoint of the continuum in eV.
+
+    Raises
+    ------
+    ValueError
+        If the grid is too short, nonuniform, or lacks the required support.
+    """
     if (
         grid.ndim != 1
         or len(grid) < 3
@@ -100,12 +147,11 @@ def _resolve_uniform_grid(
         or grid[0] != 0.0
         or np.any(np.diff(grid) <= 0.0)
         or not np.allclose(np.diff(grid), grid[1], rtol=1e-8, atol=1e-12)
-        or grid[-1] < source[-1]
+        or grid[-1] < source_end
     ):
         raise ValueError(
             "Grid must be uniform, start at zero and cover the continuum."
         )
-    return grid
 
 
 def _interpolate_weighted_continuum(
@@ -218,6 +264,71 @@ def _deposit_gaussian_oscillator(
     density += weight * (peak / area)
 
 
+def _validate_gaussian_support(
+    grid: np.ndarray,
+    active: Sequence[DiscreteOscillator],
+    oscillator_sigma_ev: float,
+    spacing: float,
+    tol: float,
+) -> None:
+    """Check that the grid resolves and contains each Gaussian oscillator.
+
+    Parameters
+    ----------
+    grid : numpy.ndarray
+        Uniform energy grid in eV.
+    active : sequence of DiscreteOscillator
+        Nonempty collection of modes with positive weight.
+    oscillator_sigma_ev : float
+        Positive Gaussian standard deviation in eV.
+    spacing : float
+        Grid spacing in eV.
+    tol : float
+        Endpoint comparison tolerance in eV.
+
+    Raises
+    ------
+    ValueError
+        If the spacing exceeds sigma / 3 or a mode lacks six sigma of support.
+    """
+    if spacing > (oscillator_sigma_ev / 3.0) * (1.0 + 1e-12):
+        raise ValueError("Gaussian modes require energy spacing at most sigma / 3.")
+    margin = _GAUSSIAN_MARGIN_SIGMAS * oscillator_sigma_ev
+    if (
+        min(mode.energy_ev for mode in active) < margin - tol
+        or max(mode.energy_ev for mode in active) > grid[-1] - margin + tol
+    ):
+        raise ValueError("Gaussian modes require six sigma of grid support on both sides.")
+
+
+def _bracket_mode_energy(grid: np.ndarray, energy: float, tol: float) -> float:
+    """Resolve a line center on the interval spanned by interior nodes.
+
+    Parameters
+    ----------
+    grid : numpy.ndarray
+        Uniform energy grid in eV.
+    energy : float
+        Oscillator center in eV.
+    tol : float
+        Allowable roundoff in eV at the interior endpoints.
+
+    Returns
+    -------
+    float
+        Oscillator energy clipped to the interior interval within tolerance.
+
+    Raises
+    ------
+    ValueError
+        If the oscillator lies outside the interior interval by more than
+        the tolerance.
+    """
+    if not grid[1] - tol <= energy <= grid[-2] + tol:
+        raise ValueError("Grid must bracket each mode with interior nodes.")
+    return min(max(energy, grid[1]), grid[-2])
+
+
 def _deposit_oscillators(
     grid: np.ndarray,
     density: np.ndarray,
@@ -259,12 +370,7 @@ def _deposit_oscillators(
     tol = 1e-12 * spacing
     active = [mode for mode in modes if mode.weight > 0.0]
     if oscillator_sigma_ev > 0.0 and active:
-        if spacing > (oscillator_sigma_ev / 3.0) * (1.0 + 1e-12):
-            raise ValueError("Gaussian modes require energy spacing at most sigma / 3.")
-        margin = _GAUSSIAN_MARGIN_SIGMAS * oscillator_sigma_ev
-        if (min(mode.energy_ev for mode in active) < margin - tol
-                       or max(mode.energy_ev for mode in active) > grid[-1] - margin + tol):
-            raise ValueError("Gaussian modes require six sigma of grid support on both sides.")
+        _validate_gaussian_support(grid, active, oscillator_sigma_ev, spacing, tol)
 
     for mode in active:
         if oscillator_sigma_ev > 0.0:
@@ -272,9 +378,7 @@ def _deposit_oscillators(
                 grid, density, mode.energy_ev, mode.weight, oscillator_sigma_ev
             )
         else:
-            if not grid[1] - tol <= mode.energy_ev <= grid[-2] + tol:
-                raise ValueError("Grid must bracket each mode with interior nodes.")
-            energy = min(max(mode.energy_ev, grid[1]), grid[-2])
+            energy = _bracket_mode_energy(grid, mode.energy_ev, tol)
             _deposit_linear_node(grid, density, energy, mode.weight, spacing)
         total_weight += mode.weight
 
@@ -342,7 +446,7 @@ def reconstruct_vibrational_spectrum(
     density = _interpolate_weighted_continuum(
         grid, continuous_spectrum, weight
     )
-    # Sum the weighted continuum and oscillator contributions before normalizing their
-    # combined shape.
     total_weight = _deposit_oscillators(grid, density, modes, weight, sigma)
-    return PhononSpectra(pd.Series(density / total_weight, index=grid)), total_weight
+    # Normalize the full spectral shape and return its physical weight separately.
+    spectrum = PhononSpectra(pd.Series(density / total_weight, index=grid))
+    return spectrum, total_weight

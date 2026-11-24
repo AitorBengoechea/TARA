@@ -492,101 +492,11 @@ class VibrationSampler:
             end_idx,
             boundaries,
         ) in enumerate(self.topology_strategy.generate_topology_plan()):
-            n_sub_samples = end_idx - start_idx
-            n_domains = len(boundaries)
-            boundaries_arr = np.asarray(boundaries, dtype=np.float64)
-
-            # Each topology block is its own LHS universe. Parameter groups
-            # have independent, stable named streams; coupling deliberately
-            # reuses one group's coordinates rather than allocating new ones.
-            coupled = self.config.variable_coupling == "coupled"
-            spatial_active = (self.config.max_energy_shift_mev > 0 or coupled
-                              or self.config.sampling_method == "monte_carlo")
-            if spatial_active:
-                spatial_multipliers = self.parameter_space.generate_domains(
-                    n_sub_samples, n_domains,
-                    correlation_strategy=self.config.correlation_strategy,
-                    subensemble_id=subensemble_id, group="vdos_spatial",
-                )
-            else:
-                spatial_multipliers = np.zeros((n_sub_samples, n_domains))
-
-            if coupled:
-                amplitude_multipliers = spatial_multipliers
-            elif (self.config.max_amplitude_shift_pct > 0
-                  or self.config.sampling_method == "monte_carlo"):
-                amplitude_multipliers = self.parameter_space.generate_domains(
-                    n_sub_samples, n_domains,
-                    correlation_strategy=self.config.correlation_strategy,
-                    subensemble_id=subensemble_id, group="vdos_amplitude",
-                )
-            else:
-                amplitude_multipliers = np.zeros((n_sub_samples, n_domains))
-
-            # Process cache-friendly matrix chunks rather than dispatching one
-            # Python function call per spectrum.
-            for local_start in range(0, n_sub_samples, int(batch_size)):
-                local_end = min(local_start + int(batch_size), n_sub_samples)
-                global_start = start_idx + local_start
-                global_end = start_idx + local_end
-
-                perturbation_batch = PerturbationBatch(
-                    start_index=global_start,
-                    end_index=global_end,
-                    boundaries=boundaries_arr,
-                    spatial_multipliers=spatial_multipliers[
-                        local_start:local_end
-                    ],
-                    amplitude_multipliers=(
-                        None
-                        if self.config.variable_coupling == "coupled"
-                        else amplitude_multipliers[local_start:local_end]
-                    ),
-                )
-
-                spectrum_batch = self._perturb_batch_arrays(
-                    batch=perturbation_batch,
-                    capacity_grid=capacity_grid,
-                    normalize=True,
-                )
-
-                if not np.allclose(
-                    spectrum_batch.energy_grid,
-                    capacity_grid,
-                    rtol=1e-10,
-                    atol=1e-12,
-                ):
-                    raise RuntimeError(
-                        "Batch spatial operator changed the canonical TARA "
-                        "energy grid. Ensemble aggregation does not interpolate."
-                    )
-
-                density_matrix[global_start:global_end, :] = (
-                    spectrum_batch.density
-                )
-                sample_lengths[global_start:global_end] = (
-                    spectrum_batch.sample_lengths
-                )
-
-            # Persist the stochastic state once per scientific topology block,
-            # independent of the transient computational batch size.
-            sampling_blocks.append(
-                SamplingBlock(
-                    start_index=start_idx,
-                    end_index=end_idx,
-                    boundaries=boundaries_arr,
-                    spatial_multipliers=self._compact_multiplier_state(
-                        spatial_multipliers
-                    ),
-                    amplitude_multipliers=(
-                        None
-                        if self.config.variable_coupling == "coupled"
-                        else self._compact_multiplier_state(
-                            amplitude_multipliers
-                        )
-                    ),
-                )
+            block = self._generate_topology_block(
+                subensemble_id, start_idx, end_idx, boundaries, int(batch_size),
+                capacity_grid, density_matrix, sample_lengths,
             )
+            sampling_blocks.append(block)
 
         return self._assemble_ensemble(
             capacity_grid,
@@ -594,6 +504,141 @@ class VibrationSampler:
             sample_lengths,
             sampling_blocks,
         )
+
+    def _generate_topology_block(
+        self, subensemble_id, start_idx, end_idx, boundaries, batch_size,
+        capacity_grid, density_matrix, sample_lengths,
+    ) -> SamplingBlock:
+        """Draw, evaluate, and record one topology block.
+
+        Parameters
+        ----------
+        subensemble_id : int
+            Index identifying the topology's random streams.
+        start_idx, end_idx : int
+            Half-open row range in the full ensemble.
+        boundaries : sequence of tuple of float
+            Domain bounds in eV.
+        batch_size : int
+            Maximum number of rows evaluated together.
+        capacity_grid : numpy.ndarray
+            Shared output grid in eV.
+        density_matrix, sample_lengths : numpy.ndarray
+            Preallocated output arrays updated in place.
+
+        Returns
+        -------
+        SamplingBlock
+            Compact copy of the random state for the block.
+        """
+        boundaries_arr = np.asarray(boundaries, dtype=np.float64)
+        spatial, amplitude = self._draw_block_multipliers(
+            end_idx - start_idx, len(boundaries), subensemble_id,
+        )
+
+        # Chunk only the numerical work. Random design is complete for the block.
+        for local_start in range(0, end_idx - start_idx, batch_size):
+            local_end = min(local_start + batch_size, end_idx - start_idx)
+            batch = PerturbationBatch(
+                start_index=start_idx + local_start,
+                end_index=start_idx + local_end,
+                boundaries=boundaries_arr,
+                spatial_multipliers=spatial[local_start:local_end],
+                amplitude_multipliers=(
+                    None if self.config.variable_coupling == "coupled"
+                    else amplitude[local_start:local_end]
+                ),
+            )
+            result = self._perturb_batch_arrays(
+                batch=batch, capacity_grid=capacity_grid, normalize=True,
+            )
+            self._store_batch_result(
+                batch, result, capacity_grid, density_matrix, sample_lengths,
+            )
+
+        return SamplingBlock(
+            start_index=start_idx,
+            end_index=end_idx,
+            boundaries=boundaries_arr,
+            spatial_multipliers=self._compact_multiplier_state(spatial),
+            amplitude_multipliers=(
+                None if self.config.variable_coupling == "coupled"
+                else self._compact_multiplier_state(amplitude)
+            ),
+        )
+
+    def _draw_block_multipliers(self, n_sub_samples: int, n_domains: int, subensemble_id: int):
+        """Draw the complete stochastic multiplier matrices for one topology.
+
+        Parameters
+        ----------
+        n_sub_samples, n_domains : int
+            Number of rows and domains in the block.
+        subensemble_id : int
+            Index identifying the random streams.
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            Spatial and amplitude multiplier matrices. Coupled designs reuse one matrix.
+        """
+        # Each topology block is its own LHS universe. Parameter groups
+        # have independent, stable named streams; coupling deliberately
+        # reuses one group's coordinates rather than allocating new ones.
+        coupled = self.config.variable_coupling == "coupled"
+        spatial_active = (self.config.max_energy_shift_mev > 0 or coupled
+                          or self.config.sampling_method == "monte_carlo")
+        if spatial_active:
+            spatial_multipliers = self.parameter_space.generate_domains(
+                n_sub_samples, n_domains,
+                correlation_strategy=self.config.correlation_strategy,
+                subensemble_id=subensemble_id, group="vdos_spatial",
+            )
+        else:
+            spatial_multipliers = np.zeros((n_sub_samples, n_domains))
+
+        if coupled:
+            amplitude_multipliers = spatial_multipliers
+        elif (self.config.max_amplitude_shift_pct > 0
+              or self.config.sampling_method == "monte_carlo"):
+            amplitude_multipliers = self.parameter_space.generate_domains(
+                n_sub_samples, n_domains,
+                correlation_strategy=self.config.correlation_strategy,
+                subensemble_id=subensemble_id, group="vdos_amplitude",
+            )
+        else:
+            amplitude_multipliers = np.zeros((n_sub_samples, n_domains))
+        return spatial_multipliers, amplitude_multipliers
+
+    @staticmethod
+    def _store_batch_result(batch, result, capacity_grid, density_matrix, sample_lengths) -> None:
+        """Write one validated result to the preallocated ensemble arrays.
+
+        Parameters
+        ----------
+        batch : PerturbationBatch
+            Input batch carrying the destination sample indices.
+        result : SpectrumBatch
+            Warped and normalized spectra for the batch.
+        capacity_grid : numpy.ndarray
+            Canonical energy coordinates in eV.
+        density_matrix, sample_lengths : numpy.ndarray
+            Destination density rows and support lengths.
+
+        Raises
+        ------
+        RuntimeError
+            If the result does not use the canonical grid.
+        """
+        if not np.allclose(result.energy_grid, capacity_grid, rtol=1e-10, atol=1e-12):
+            raise RuntimeError(
+                "Batch spatial operator changed the canonical TARA "
+                "energy grid. Ensemble aggregation does not interpolate."
+            )
+
+        rows = slice(batch.start_index, batch.end_index)
+        density_matrix[rows, :] = result.density
+        sample_lengths[rows] = result.sample_lengths
 
     def _generation_record(self, n_samples: int) -> EnsembleGeneration:
         """
@@ -852,11 +897,48 @@ class VibrationSampler:
         density = np.asarray(batch.density, dtype=np.float64)
         sample_lengths = np.asarray(batch.sample_lengths, dtype=np.int64)
 
+        VibrationSampler._validate_batch_layout(x_grid, density, sample_lengths)
+
+        areas = VibrationSampler._integrate_batch_support(x_grid, density, sample_lengths)
+
+        if not np.all(np.isfinite(areas)) or np.any(areas <= 0.0):
+            invalid = np.flatnonzero((~np.isfinite(areas)) | (areas <= 0.0))
+            raise RuntimeError(
+                "Generated phonon-density batch contains non-positive or "
+                f"non-finite integrals at rows {invalid.tolist()}."
+            )
+
+        if normalize:
+            density /= areas[:, None]
+
+        return SpectrumBatch(
+            energy_grid=x_grid,
+            density=density,
+            sample_lengths=sample_lengths,
+        )
+
+    @staticmethod
+    def _validate_batch_layout(x_grid, density, sample_lengths) -> None:
+        """Validate the grid and physical support of a generated batch.
+
+        Parameters
+        ----------
+        x_grid : numpy.ndarray
+            Shared energy grid in eV.
+        density : numpy.ndarray
+            Density matrix on the shared energy grid.
+        sample_lengths : numpy.ndarray
+            Number of valid grid points per sample row.
+
+        Raises
+        ------
+        RuntimeError
+            If the grid, row lengths, or density values are invalid.
+        """
         if x_grid.ndim != 1 or x_grid.size < 2:
             raise RuntimeError(
                 "Generated batch energy grid must contain at least two points."
             )
-        # Examine adjacent grid differences to enforce ordering or locate transitions.
         if np.any(x_grid < 0.0) or np.any(np.diff(x_grid) <= 0.0):
             raise RuntimeError(
                 "Generated batch energy grid must be strictly increasing and "
@@ -887,6 +969,24 @@ class VibrationSampler:
                 "Generated phonon-density batch contains negative values."
             )
 
+    @staticmethod
+    def _integrate_batch_support(x_grid, density, sample_lengths) -> np.ndarray:
+        """Zero padded cells and integrate each row over its physical support.
+
+        Parameters
+        ----------
+        x_grid : numpy.ndarray
+            Shared energy grid in eV.
+        density : numpy.ndarray
+            Density matrix on the shared energy grid.
+        sample_lengths : numpy.ndarray
+            Number of valid grid points per sample row.
+
+        Returns
+        -------
+        numpy.ndarray
+            Trapezoidal integral of each density row.
+        """
         # Enforce the storage invariant explicitly: columns outside each row's
         # physical support are zero padding and must never affect normalization.
         columns = np.arange(x_grid.size)[None, :]
@@ -910,21 +1010,7 @@ class VibrationSampler:
             axis=1,
         )
 
-        if not np.all(np.isfinite(areas)) or np.any(areas <= 0.0):
-            invalid = np.flatnonzero((~np.isfinite(areas)) | (areas <= 0.0))
-            raise RuntimeError(
-                "Generated phonon-density batch contains non-positive or "
-                f"non-finite integrals at rows {invalid.tolist()}."
-            )
-
-        if normalize:
-            density /= areas[:, None]
-
-        return SpectrumBatch(
-            energy_grid=x_grid,
-            density=density,
-            sample_lengths=sample_lengths,
-        )
+        return areas
 
     def _perturb_single_sample_arrays(
         self,
@@ -1023,32 +1109,7 @@ class VibrationSampler:
         x_shifted = np.asarray(x_shifted, dtype=np.float64)
         y_final = np.asarray(y_final, dtype=np.float64)
 
-        if x_shifted.ndim != 1 or y_final.ndim != 1:
-            raise RuntimeError(
-                "Generated spectrum arrays must be one-dimensional."
-            )
-        if x_shifted.size != y_final.size or x_shifted.size < 2:
-            raise RuntimeError(
-                "Generated energy and density arrays must have equal length "
-                "and contain at least two points."
-            )
-        if not np.all(np.isfinite(x_shifted)) or not np.all(np.isfinite(y_final)):
-            raise RuntimeError(
-                "Generated spectrum contains NaN or infinite values."
-            )
-        # Examine adjacent grid differences to enforce ordering or locate transitions.
-        if np.any(x_shifted < 0.0) or np.any(np.diff(x_shifted) <= 0.0):
-            raise RuntimeError(
-                "Generated energy grid must be strictly increasing and non-negative."
-            )
-        if not np.isclose(x_shifted[0], 0.0, rtol=0.0, atol=1e-14):
-            raise RuntimeError(
-                "Generated TARA spectra must retain the zero-energy origin."
-            )
-        if np.any(y_final < 0.0):
-            raise RuntimeError(
-                "Generated phonon density contains negative values."
-            )
+        VibrationSampler._validate_single_spectrum_layout(x_shifted, y_final)
 
         # Integrate against the physical coordinate grid, accounting for nonuniform spacing.
         area = float(np.trapezoid(y_final, x_shifted))
@@ -1063,6 +1124,46 @@ class VibrationSampler:
             y_final /= area
 
         return x_shifted, y_final
+
+    @staticmethod
+    def _validate_single_spectrum_layout(x_shifted, y_final) -> None:
+        """Validate the physical coordinate and density arrays for one spectrum.
+
+        Parameters
+        ----------
+        x_shifted, y_final : numpy.ndarray
+            Generated energy grid in eV and its density values.
+
+        Raises
+        ------
+        RuntimeError
+            If the arrays, zero-energy origin, or density are invalid.
+        """
+        if x_shifted.ndim != 1 or y_final.ndim != 1:
+            raise RuntimeError(
+                "Generated spectrum arrays must be one-dimensional."
+            )
+        if x_shifted.size != y_final.size or x_shifted.size < 2:
+            raise RuntimeError(
+                "Generated energy and density arrays must have equal length "
+                "and contain at least two points."
+            )
+        if not np.all(np.isfinite(x_shifted)) or not np.all(np.isfinite(y_final)):
+            raise RuntimeError(
+                "Generated spectrum contains NaN or infinite values."
+            )
+        if np.any(x_shifted < 0.0) or np.any(np.diff(x_shifted) <= 0.0):
+            raise RuntimeError(
+                "Generated energy grid must be strictly increasing and non-negative."
+            )
+        if not np.isclose(x_shifted[0], 0.0, rtol=0.0, atol=1e-14):
+            raise RuntimeError(
+                "Generated TARA spectra must retain the zero-energy origin."
+            )
+        if np.any(y_final < 0.0):
+            raise RuntimeError(
+                "Generated phonon density contains negative values."
+            )
 
     def _perturb_single_sample(
         self,
@@ -1136,32 +1237,115 @@ class TaraSampler:
         *,
         material: MaterialScatteringModel | None = None,
     ) -> None:
+        """Set up the active sampling components.
+
+        Parameters
+        ----------
+        config : TaraConfig
+            Shared vibration and diffusion settings.
+        spectra : PhononSpectra or None, optional
+            Explicit reference spectrum, if supplied.
+        amplitude_method : {"precise", "fast"}, optional
+            Vibration amplitude method. Default is "fast".
+        spatial_method : {"diffeomorphic", "crossfade"}, optional
+            Vibration spatial method. Default is "diffeomorphic".
+        material : MaterialScatteringModel or None, optional
+            Physical reference used for diffusion or to supply a spectrum.
+
+        Raises
+        ------
+        ValueError
+            If an active sampling component lacks its required reference.
+        """
         self.config = config
-        self._diffusion_sampler = None
-        self._vibration_sampler = None
+        self._diffusion_sampler = (
+            self._make_diffusion_sampler(config, material) if config.diffusion_enabled else None
+        )
+        self._vibration_sampler = (
+            self._make_vibration_sampler(config, spectra, material, amplitude_method, spatial_method)
+            if config.vibration_enabled else None
+        )
 
-        if config.diffusion_enabled:
+    @staticmethod
+    def _make_diffusion_sampler(config, material) -> DiffusionSampler:
+        """Initialize diffusion with the experiment's appropriate random stream.
+
+        Parameters
+        ----------
+        config : TaraConfig
+            Configuration with active diffusion.
+        material : MaterialScatteringModel or None
+            Reference material for translation.
+
+        Returns
+        -------
+        DiffusionSampler
+            Configured sampler for translation parameters.
+
+        Raises
+        ------
+        ValueError
+            If the required liquid reference is absent.
+        """
+        if material is None:
+            raise ValueError("Diffusion sampling requires a reference material.")
+        seed = config.random_seed
+        if config.sampling_method == "monte_carlo":
+            # Retain the historical ACE stream independently of VDOS draws.
+            seed = int(np.random.SeedSequence([seed, 0xD1FF]).generate_state(1)[0])
+        return DiffusionSampler(
+            material, config.diffusion, seed=seed, sampling_method=config.sampling_method,
+        )
+
+    @staticmethod
+    def _make_vibration_sampler(config, spectra, material, amplitude_method, spatial_method) -> VibrationSampler:
+        """Resolve a reference spectrum and initialize vibrational perturbations.
+
+        Parameters
+        ----------
+        config : TaraConfig
+            Configuration with active vibrational perturbations.
+        spectra : PhononSpectra or None
+            Explicit reference spectrum, if supplied.
+        material : MaterialScatteringModel or None
+            Material whose continuous spectrum can supply the reference.
+        amplitude_method, spatial_method : str
+            Selected vibration perturbation operators.
+
+        Returns
+        -------
+        VibrationSampler
+            Initialized vibrational sampler.
+
+        Raises
+        ------
+        ValueError
+            If neither source provides a vibrational spectrum.
+        """
+        if spectra is None:
             if material is None:
-                raise ValueError("Diffusion sampling requires a reference material.")
-            seed = config.random_seed
-            if config.sampling_method == "monte_carlo":
-                # Use the historical ACE diffusion stream independently of VDOS draws.
-                seed = int(np.random.SeedSequence([seed, 0xD1FF]).generate_state(1)[0])
-            self._diffusion_sampler = DiffusionSampler(
-                material, config.diffusion, seed=seed, sampling_method=config.sampling_method,
-            )
-
-        if config.vibration_enabled:
-            if spectra is None:
-                if material is None:
-                    raise ValueError("Vibration sampling requires a reference spectrum or material.")
-                spectra = material.dynamics.continuous
-            self._vibration_sampler = VibrationSampler(
-                config, spectra, amplitude_method, spatial_method,
-            )
+                raise ValueError("Vibration sampling requires a reference spectrum or material.")
+            spectra = material.dynamics.continuous
+        return VibrationSampler(config, spectra, amplitude_method, spatial_method)
 
     def __getattr__(self, name: str):
-        """Preserve access to vibration diagnostics on existing sampler instances."""
+        """Resolve a legacy vibration diagnostic on the internal sampler.
+
+        Parameters
+        ----------
+        name : str
+            Attribute name requested from the public façade.
+
+        Returns
+        -------
+        object
+            Value provided by the vibrational sampler.
+
+        Raises
+        ------
+        AttributeError
+            If vibration is inactive or the attribute is absent.
+        """
         vibration = object.__getattribute__(self, "_vibration_sampler")
         if vibration is None:
             raise AttributeError(name)
@@ -1201,8 +1385,6 @@ class TaraSampler:
         spectra_ensemble = None
         if self._vibration_sampler is not None:
             spectra_ensemble = self._vibration_sampler.generate_ensemble(batch_size=batch_size)
-        # Reuse the vibrational sample indices and topology blocks when drawing
-        # diffusion parameters.
         if self._diffusion_sampler is not None:
             return self._diffusion_sampler.generate_ensemble(
                 self.config.n_samples, spectra_ensemble=spectra_ensemble,

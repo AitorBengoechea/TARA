@@ -5,7 +5,6 @@ import numpy as np
 from abc import ABC, abstractmethod
 from typing import List, Tuple, Iterator
 
-# Assuming these are accessible in your python path
 from core.config import TaraConfig
 from core.sampler.domain_partitioner import DomainPartitioner
 
@@ -15,6 +14,13 @@ class TopologyStrategy(ABC):
 
     This strategy dictates how the x-range structure behaves across the
     total requested sample ensemble (N_samples).
+
+    Parameters
+    ----------
+    config : TaraConfig
+        Sample count, design method, and topology settings.
+    partitioner : DomainPartitioner
+        Reference domain partition and Top-K selections.
 
     Attributes
     ----------
@@ -44,12 +50,8 @@ class TopologyStrategy(ABC):
 
         Yields
         ------
-        int
-            The starting sample index for this sub-ensemble.
-        int
-            The ending sample index for this sub-ensemble.
-        list of tuple of float
-            The specific energy boundaries to use for these samples.
+        tuple of int, int, and list of tuple of float
+            Half-open sample range and its energy domains in eV.
         """
         pass
 
@@ -64,17 +66,16 @@ class FixedTopology(TopologyStrategy):
     """
 
     def generate_topology_plan(self) -> Iterator[Tuple[int, int, List[Tuple[float, float]]]]:
-        # Yields a single sub-ensemble containing all requested samples
-        """Assign samples to the selected domain-partitioning topology.
+        """Yield a single block with the reference partition.
 
-        Returns
-        -------
-        Iterator[Tuple[int, int, List[Tuple[float, float]]]]
-            Calculated arrays or records in the order described by the operation.
+        Yields
+        ------
+        tuple of int, int, and list of tuple of float
+            The complete sample range and its fixed domain bounds.
         """
         yield (
-            0, 
-            self.config.n_samples, 
+            0,
+            self.config.n_samples,
             self.partitioner.base_partitions
         )
 
@@ -88,40 +89,40 @@ class DeterministicTopology(TopologyStrategy):
     """
 
     def generate_topology_plan(self) -> Iterator[Tuple[int, int, List[Tuple[float, float]]]]:
-        """Assign samples to the selected domain-partitioning topology.
+        """Allocate consecutive blocks to increasing Top-K partitions.
 
-        Returns
-        -------
-        Iterator[Tuple[int, int, List[Tuple[float, float]]]]
-            Calculated arrays or records in the order described by the operation.
+        Yields
+        ------
+        tuple of int, int, and list of tuple of float
+            Half-open sample range and its deterministically selected domain bounds.
         """
         n_samples = self.config.n_samples
         n_partition = self.partitioner.max_partitions
-        
-        # Valid partitions range from 2 to the maximum detected natural domains (N_partition)[cite: 3].
+
+        # With at most two domains, retain the reference partition.
         if n_partition <= 2:
             yield (0, n_samples, self.partitioner.base_partitions)
             return
 
-        # Each sub-ensemble contains exactly N_samples / (N_partition - 2) samples[cite: 3].
+        # Sweep from two domains up to one fewer than the reference partition.
         n_options = n_partition - 2
         sub_ensemble_size = max(1, n_samples // n_options)
-        
+
         current_idx = 0
-        
+
         # Iterate through the valid K options
         for k in range(2, n_partition):
             if current_idx >= n_samples:
                 break
-                
+
             end_idx = min(current_idx + sub_ensemble_size, n_samples)
             # If this is the last option, ensure it absorbs any remaining samples due to rounding
             if k == n_partition - 1:
                 end_idx = n_samples
-                
+
             partitions = self.partitioner.get_top_k_partitions(k)
             yield (current_idx, end_idx, partitions)
-            
+
             current_idx = end_idx
 
 
@@ -133,12 +134,12 @@ class RandomTopology(TopologyStrategy):
     """
 
     def generate_topology_plan(self) -> Iterator[Tuple[int, int, List[Tuple[float, float]]]]:
-        """Assign samples to the selected domain-partitioning topology.
+        """Draw the partition size for each consecutive sample block.
 
-        Returns
-        -------
-        Iterator[Tuple[int, int, List[Tuple[float, float]]]]
-            Calculated arrays or records in the order described by the operation.
+        Yields
+        ------
+        tuple of int, int, and list of tuple of float
+            Half-open sample range and its randomly selected domain bounds.
         """
         n_samples = self.config.n_samples
         n_partition = self.partitioner.max_partitions
@@ -147,35 +148,42 @@ class RandomTopology(TopologyStrategy):
             yield (0, n_samples, self.partitioner.base_partitions)
             return
 
-        # The algorithm dictates the number of sub-ensembles through the 
-        # mathematical relation N_samples / N_random[cite: 3].
-        # (Assuming an algorithmic default of N_random = 4 if not exposed in config)
+        # Use the historical default of four when the configuration has no override.
         n_random = getattr(self.config, 'n_random', 4)
         sub_ensemble_size = max(1, n_samples // n_random)
-        
-        # LHS design streams and the discrete topology stream must remain
-        # separate. Preserve the exact legacy global RNG for Monte Carlo.
-        topology_rng = (
+
+        topology_rng = self._topology_rng()
+        current_idx = 0
+
+        while current_idx < n_samples:
+            end_idx = min(current_idx + sub_ensemble_size, n_samples)
+
+            # Draw once for each block so all its samples share a partition.
+            random_k = (np.random.randint(2, n_partition + 1)
+                        if topology_rng is None else
+                        int(topology_rng.integers(2, n_partition + 1)))
+            partitions = self.partitioner.get_top_k_partitions(random_k)
+
+            yield (current_idx, end_idx, partitions)
+
+            current_idx = end_idx
+
+    def _topology_rng(self) -> np.random.Generator | None:
+        """Resolve the random stream used for discrete topology choices.
+
+        Returns
+        -------
+        numpy.random.Generator or None
+            Independent stream for Latin hypercube designs. None selects the
+            legacy global Monte Carlo stream.
+        """
+        # Distinguish topology choices from the named continuous streams.
+        return (
             np.random.default_rng(np.random.SeedSequence(
                 [self.config.random_seed, 0x70A0]
             ))
             if self.config.sampling_method == "latin_hypercube" else None
         )
-        current_idx = 0
-
-        while current_idx < n_samples:
-            end_idx = min(current_idx + sub_ensemble_size, n_samples)
-            
-            # An independent random integer is drawn to dynamically select the 
-            # exact Top-K selection constraint[cite: 3].
-            random_k = (np.random.randint(2, n_partition + 1)
-                        if topology_rng is None else
-                        int(topology_rng.integers(2, n_partition + 1)))
-            partitions = self.partitioner.get_top_k_partitions(random_k)
-            
-            yield (current_idx, end_idx, partitions)
-            
-            current_idx = end_idx
 
 
 def get_topology_strategy(config: TaraConfig, partitioner: DomainPartitioner) -> TopologyStrategy:
@@ -204,11 +212,11 @@ def get_topology_strategy(config: TaraConfig, partitioner: DomainPartitioner) ->
         "deterministic": DeterministicTopology,
         "random": RandomTopology
     }
-    
+
     strat_class = strategy_map.get(config.domain_splitting_strategy)
     if not strat_class:
         raise ValueError(
             f"Unknown domain splitting strategy: {config.domain_splitting_strategy}"
         )
-        
+
     return strat_class(config, partitioner)

@@ -117,12 +117,27 @@ class SpeciesDynamics:
 
     def __post_init__(self) -> None:
         """Enforce normalized independent physical contributions."""
+        # Keep the continuum shape normalized independently of its physical weight.
         if not isinstance(self.continuous, PhononSpectra):
             raise TypeError("continuous must be a PhononSpectra instance.")
         if not math.isclose(self.continuous.integral, 1.0, rel_tol=0, abs_tol=1e-8):
             raise ValueError("Continuous spectrum must be normalized to unit area.")
+
+        # Validate the individual weights before testing their sum.
         _finite(self.continuous_weight, "Continuous weight")
         _finite(self.translation_weight, "Translation weight")
+        self._validate_translation()
+        self._validate_component_weights()
+
+    def _validate_translation(self) -> None:
+        """Check translation model, parameter, and weight consistency.
+
+        Raises
+        ------
+        ValueError
+            If the translation model or its parameters are inconsistent.
+        """
+        # Only the Egelstaff–Schofield model carries an explicit diffusion parameter.
         if self.translation_model not in ("none", "free_gas", "egelstaff_schofield"):
             raise ValueError("Unsupported translation model.")
         if self.translation_model == "egelstaff_schofield":
@@ -131,8 +146,19 @@ class SpeciesDynamics:
             _finite(self.translation_parameter, "Egelstaff--Schofield c", positive=True)
         elif self.translation_parameter is not None:
             raise ValueError("A diffusion parameter requires Egelstaff--Schofield translation.")
+        # A zero translation weight goes with the no-translation model.
         if (self.translation_model == "none") != (self.translation_weight == 0):
             raise ValueError("Translation model and translation weight are inconsistent.")
+
+    def _validate_component_weights(self) -> None:
+        """Validate oscillator identities and the combined component weight.
+
+        Raises
+        ------
+        ValueError
+            If oscillator labels repeat or component weights do not sum to unity within tolerance.
+        """
+        # Keep oscillator identities unambiguous when matching individual modes.
         names = [osc.label for osc in self.oscillators]
         if len(names) != len(set(names)):
             raise ValueError("Oscillator labels must be unique.")
@@ -199,6 +225,9 @@ class MaterialScatteringModel:
         if not self.identifier.strip() or self.state not in ("solid", "liquid"):
             raise ValueError("A material identifier and state (solid/liquid) are required.")
         _finite(self.temperature_k, "Temperature", positive=True)
+
+        # Species labels must identify a single component across both scatterer
+        # groups.
         names = [self.principal.label] + [item.label for item in self.secondary]
         if len(names) != len(set(names)):
             raise ValueError("Material scattering species must have unique labels.")

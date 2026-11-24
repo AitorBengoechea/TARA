@@ -5,7 +5,6 @@ import numpy as np
 from typing import List, Tuple
 from scipy.signal import find_peaks
 
-# Assuming these are accessible in your python path based on the new structure
 from core.data.input_pdos import PhononSpectra
 from core.config import TaraConfig
 
@@ -16,6 +15,13 @@ class DomainPartitioner:
     This class determines how the baseline phonon spectrum is partitioned into
     active perturbation regions. It handles both explicit manual definitions
     and automatic natural domain extraction based on local extrema.
+
+    Parameters
+    ----------
+    spectra : PhononSpectra
+        Reference spectrum to partition.
+    config : TaraConfig
+        Manual or automatic partitioning settings.
 
     Attributes
     ----------
@@ -65,11 +71,9 @@ class DomainPartitioner:
             The foundational energy boundaries.
         """
         if self.config.grid_partition_method == "manual":
-            # The user explicitly defines specific energy intervals[cite: 3].
+            # Manual intervals also leave gaps unperturbed.
             return self.config.manual_energy_ranges
-        else:
-            # TARA automatically partitions the phonon spectrum[cite: 3].
-            return self._automatic_partition()
+        return self._automatic_partition()
 
     def _automatic_partition(self) -> List[Tuple[float, float]]:
         """Identifies natural domains based on local minima and maxima to isolate
@@ -105,13 +109,15 @@ class DomainPartitioner:
     def get_top_k_partitions(self, k: int) -> List[Tuple[float, float]]:
         """Applies Top-K selection and unioning to resolve structural confinement bias.
 
-        This method extracts only the top K ranges containing the largest probability mass,
-        while adjacent minor regions are dynamically merged via the precise integral median.
+        Automatic domains are ranked by integrated spectral density. Their
+        upper boundaries determine the merged intervals. Manual domains are
+        returned as supplied.
 
         Parameters
         ----------
         k : int
-            The target number of domains to return. Must be between 1 and max_partitions.
+            Requested positive domain count. A count at or above the number
+            of base domains returns the original partitions.
 
         Returns
         -------
@@ -124,50 +130,59 @@ class DomainPartitioner:
             If the requested k is invalid for the current base partitions.
         """
         if self.config.grid_partition_method == "manual":
-            # Manual domains are strictly explicitly defined and leave the rest 
+            # Manual domains are strictly explicitly defined and leave the rest
             # of the spectrum unperturbed; unioning is mathematically invalid here[cite: 3].
             return self.base_partitions
 
         if k >= self.max_partitions:
             return self.base_partitions
-            
+
         if k < 1:
             raise ValueError("K must be at least 1.")
 
-        # 1. Calculate probability mass (integral) for each base partition
-        domain_masses = []
+        masses = self._partition_masses()
+        # Preserve source order after ranking by integrated density.
+        selected = sorted(np.argsort(masses)[-k:])
+        return self._merge_selected_partitions(selected)
+
+    def _partition_masses(self) -> list[float]:
+        """Integrate the reference density over each base partition.
+
+        Returns
+        -------
+        list of float
+            Integrated density in source partition order.
+        """
+        energy = self.spectra.energy_grid
+        density = self.spectra.density_values
+        masses = []
         for start, end in self.base_partitions:
-            mask = (self.spectra.energy_grid >= start) & (self.spectra.energy_grid <= end)
-            # Integrate against the physical coordinate grid, accounting for nonuniform spacing.
-            mass = np.trapezoid(self.spectra.density_values[mask], self.spectra.energy_grid[mask])
-            domain_masses.append(mass)
+            mask = (energy >= start) & (energy <= end)
+            masses.append(np.trapezoid(density[mask], energy[mask]))
+        return masses
 
-        # 2. Identify the indices of the Top-K largest domains
-        top_k_indices = sorted(np.argsort(domain_masses)[-k:])
+    def _merge_selected_partitions(self, selected) -> List[Tuple[float, float]]:
+        """Merge neighboring ranges at the upper edges of selected partitions.
 
-        # 3. Merge minor adjacent regions via integral median
-        merged_partitions = []
-        
-        # NOTE: This section implements the structural logic for merging. 
-        # For full physical accuracy, the "precise integral median" solver 
-        # algorithm would replace the simplified midpoint logic below.
-        
+        Parameters
+        ----------
+        selected : sequence of int
+            Selected partition indices in ascending source order.
+
+        Returns
+        -------
+        list of tuple of float
+            Contiguous merged ranges covering the reference energy support.
+        """
+        merged = []
         current_start = self.base_partitions[0][0]
-        for i in top_k_indices:
-            # The domain ends at the original end of the selected Top-K peak
-            current_end = self.base_partitions[i][1]
-            
-            # If there are minor domains trailing after this peak before the next 
-            # Top-K peak, we find the median integral point between them.
-            # (Simplified here to merge directly; actual median math requires CDF inversion).
-            merged_partitions.append((current_start, current_end))
-            
-            # Update the start for the next block
+        for index in selected:
+            current_end = self.base_partitions[index][1]
+            merged.append((current_start, current_end))
             current_start = current_end
 
-        # Ensure the absolute final boundary is closed properly
-        if merged_partitions[-1][1] != self.base_partitions[-1][1]:
-            last_start = merged_partitions[-1][0]
-            merged_partitions[-1] = (last_start, self.base_partitions[-1][1])
-
-        return merged_partitions
+        # Assign the remaining high-energy tail to the last merged partition.
+        last_end = self.base_partitions[-1][1]
+        if merged[-1][1] != last_end:
+            merged[-1] = (merged[-1][0], last_end)
+        return merged

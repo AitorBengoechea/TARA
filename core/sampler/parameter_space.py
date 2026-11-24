@@ -21,28 +21,30 @@ SAMPLING_METHODS = frozenset({'latin_hypercube', 'monte_carlo'})
 class ParameterSpaceSampler:
     """Produce signed uniform multipliers for named parameter groups.
 
+    ``monte_carlo`` with no supplied ``rng`` uses NumPy's legacy global
+    generator to preserve VDOS sequences. Supply a local generator for
+    diffusion Monte Carlo. Latin hypercube sampling uses group-specific
+    streams independently of the global generator.
+
     Parameters
     ----------
-    sampling_method : str, optional
-        Perturbation design. Use "latin_hypercube" or "monte_carlo". Default
-        is "latin_hypercube".
+    sampling_method : {"latin_hypercube", "monte_carlo"}, optional
+        Design used to generate multipliers. Default is "latin_hypercube".
     seed : int, optional
-        Seed in [0, 2**32) used to derive the named Latin-hypercube streams.
-        Default is 0.
-
-    Notes
-    -----
-    ``monte_carlo`` with no supplied ``rng`` uses NumPy's legacy global
-    generator to preserve VDOS sequences. Supply a local Generator for the
-    original diffusion Monte Carlo behavior. ``latin_hypercube`` uses
-    group-specific SeedSequence streams, independently of the global RNG.
+        Seed for the named Latin-hypercube streams. Default is 0.
     """
 
     sampling_method: str = 'latin_hypercube'
     seed: int = 0
 
     def __post_init__(self) -> None:
-        """Require a supported design and an integer seed in [0, 2**32)."""
+        """Validate the design method and seed.
+
+        Raises
+        ------
+        ValueError
+            If the design is unsupported or the seed is outside [0, 2**32).
+        """
         if self.sampling_method not in SAMPLING_METHODS:
             raise ValueError(f'sampling_method must be one of {sorted(SAMPLING_METHODS)}.')
         if type(self.seed) is not int or not 0 <= self.seed < 2**32:
@@ -57,11 +59,57 @@ class ParameterSpaceSampler:
         group: str,
         rng: np.random.Generator | None = None,
     ) -> np.ndarray:
-        """Generate one signed matrix with shape ``(n_samples, n_dimensions)``.
+        """Draw signed multipliers on one named parameter stream.
 
-        In LHS mode, each column occupies every equal-probability stratum
-        exactly once; different named groups and sub-ensembles get separate
-        deterministic streams. Zero-dimensional requests return empty arrays.
+        Parameters
+        ----------
+        n_samples, n_dimensions : int
+            Number of sample rows and independent design columns.
+        subensemble_id : int, optional
+            Topology block index within the ensemble.
+        group : str
+            Stable name of the parameter stream.
+        rng : numpy.random.Generator or None, optional
+            Local Monte Carlo stream. None uses the legacy NumPy generator.
+
+        Returns
+        -------
+        numpy.ndarray
+            Matrix of shape (n_samples, n_dimensions) with values in [-1, 1].
+
+        Raises
+        ------
+        ValueError
+            If the sample count, dimension count, topology index, or name is invalid.
+        """
+        self._validate_design_request(n_samples, n_dimensions, subensemble_id, group)
+        if n_dimensions == 0:
+            return np.empty((n_samples, 0), dtype=np.float64)
+
+        if self.sampling_method == 'monte_carlo':
+            if rng is None:
+                return np.random.uniform(-1., 1., size=(n_samples, n_dimensions))
+            return rng.uniform(-1., 1., size=(n_samples, n_dimensions))
+
+        return self._latin_hypercube(n_samples, n_dimensions, subensemble_id, group)
+
+    @staticmethod
+    def _validate_design_request(n_samples, n_dimensions, subensemble_id, group) -> None:
+        """Validate the dimensions and identity of a parameter-space design.
+
+        Parameters
+        ----------
+        n_samples, n_dimensions : int
+            Number of sample rows and independent design columns.
+        subensemble_id : int
+            Topology block index within the ensemble.
+        group : str
+            Stable name of the parameter stream.
+
+        Raises
+        ------
+        ValueError
+            If the matrix dimensions, topology index, or stream name are invalid.
         """
         if type(n_samples) is not int or n_samples <= 0:
             raise ValueError('n_samples must be a positive integer.')
@@ -71,14 +119,24 @@ class ParameterSpaceSampler:
             raise ValueError('subensemble_id must be a nonnegative integer.')
         if not isinstance(group, str) or not group:
             raise ValueError('group must be a nonempty string.')
-        if n_dimensions == 0:
-            return np.empty((n_samples, 0), dtype=np.float64)
 
-        if self.sampling_method == 'monte_carlo':
-            if rng is None:
-                return np.random.uniform(-1., 1., size=(n_samples, n_dimensions))
-            return rng.uniform(-1., 1., size=(n_samples, n_dimensions))
+    def _latin_hypercube(self, n_samples, n_dimensions, subensemble_id, group) -> np.ndarray:
+        """Draw independent stratified coordinates for each design column.
 
+        Parameters
+        ----------
+        n_samples, n_dimensions : int
+            Number of sample rows and independent design columns.
+        subensemble_id : int
+            Topology block index within the ensemble.
+        group : str
+            Stable name of the parameter stream.
+
+        Returns
+        -------
+        numpy.ndarray
+            Signed Latin-hypercube coordinates with one row per sample.
+        """
         # CRC32 is intentionally stable across processes, unlike Python hash().
         group_code = zlib.crc32(group.encode('utf-8'))
         local_rng = np.random.default_rng(
@@ -86,8 +144,7 @@ class ParameterSpaceSampler:
         )
         output = np.empty((n_samples, n_dimensions), dtype=np.float64)
         for column in range(n_dimensions):
-            # Assign every stratum once per column, then jitter uniformly within each
-            # stratum.
+            # Visit each stratum once, then jitter within it.
             permutation = local_rng.permutation(n_samples)
             jitter = local_rng.random(n_samples)
             output[:, column] = 2.0 * (permutation + jitter) / n_samples - 1.0
@@ -103,7 +160,31 @@ class ParameterSpaceSampler:
         group: str,
         rng: np.random.Generator | None = None,
     ) -> np.ndarray:
-        """Generate a full or broadcast domain matrix from active dimensions."""
+        """Draw full or broadcast multipliers for the configured correlation.
+
+        Parameters
+        ----------
+        n_samples, n_domains : int
+            Number of sample rows and domain columns.
+        correlation_strategy : {"independent", "random_group"}
+            Whether each domain gets a separate coordinate or shares one per row.
+        subensemble_id : int
+            Index of the topology block.
+        group : str
+            Stable name of the parameter stream.
+        rng : numpy.random.Generator or None, optional
+            Local Monte Carlo stream. None uses the legacy NumPy generator.
+
+        Returns
+        -------
+        numpy.ndarray
+            Multiplier matrix with one row per sample and one column per domain.
+
+        Raises
+        ------
+        ValueError
+            If the domain count or correlation strategy is invalid.
+        """
         if type(n_domains) is not int or n_domains <= 0:
             raise ValueError('n_domains must be a positive integer.')
         if correlation_strategy not in ('independent', 'random_group'):

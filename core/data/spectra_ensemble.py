@@ -142,8 +142,9 @@ class SamplingBlock:
         Raises
         ------
         ValueError
-            If the input or required state violates the operation contract.
+            If the block range, domain bounds, or multiplier arrays are invalid.
         """
+        # Track each topology block with a nonempty half-open range of sample indices.
         if self.start_index < 0 or self.end_index <= self.start_index:
             raise ValueError(
                 "SamplingBlock requires 0 <= start_index < end_index."
@@ -152,15 +153,9 @@ class SamplingBlock:
         boundaries = np.asarray(self.boundaries, dtype=np.float64)
         spatial = np.asarray(self.spatial_multipliers, dtype=np.float64)
 
-        if boundaries.ndim != 2 or boundaries.shape[1] != 2:
-            raise ValueError("boundaries must have shape (n_domains, 2).")
-        if boundaries.shape[0] == 0:
-            raise ValueError("SamplingBlock requires at least one domain.")
-        if not np.all(np.isfinite(boundaries)):
-            raise ValueError("SamplingBlock boundaries must be finite.")
-        if np.any(boundaries[:, 0] >= boundaries[:, 1]):
-            raise ValueError("Every SamplingBlock boundary must satisfy start < end.")
+        self._validate_boundaries(boundaries)
 
+        # Use the block range and domain count to check the multiplier layout.
         n_samples = self.end_index - self.start_index
         n_domains = boundaries.shape[0]
 
@@ -171,6 +166,7 @@ class SamplingBlock:
             name="spatial_multipliers",
         )
 
+        # Validate a separate amplitude design only when the block stores one.
         amplitude = self.amplitude_multipliers
         if amplitude is not None:
             amplitude = np.asarray(amplitude, dtype=np.float64)
@@ -181,37 +177,54 @@ class SamplingBlock:
                 name="amplitude_multipliers",
             )
 
-        # Copy once at the block boundary so the stored provenance is stable
-        # even after the sampler releases or reuses its working arrays.
-        boundaries = np.array(
-            boundaries,
-            dtype=np.float64,
-            order="C",
-            copy=True,
-        )
-        spatial = np.array(
-            spatial,
-            dtype=np.float64,
-            order="C",
-            copy=True,
-        )
+        object.__setattr__(self, "boundaries", self._freeze_array(boundaries))
+        object.__setattr__(self, "spatial_multipliers", self._freeze_array(spatial))
         if amplitude is not None:
-            amplitude = np.array(
-                amplitude,
-                dtype=np.float64,
-                order="C",
-                copy=True,
-            )
-
-        # Sampling provenance is immutable after ensemble construction.
-        boundaries.setflags(write=False)
-        spatial.setflags(write=False)
-        if amplitude is not None:
-            amplitude.setflags(write=False)
-
-        object.__setattr__(self, "boundaries", boundaries)
-        object.__setattr__(self, "spatial_multipliers", spatial)
+            amplitude = self._freeze_array(amplitude)
         object.__setattr__(self, "amplitude_multipliers", amplitude)
+
+    @staticmethod
+    def _freeze_array(values: np.ndarray) -> np.ndarray:
+        """Take ownership of immutable sampling provenance.
+
+        Parameters
+        ----------
+        values : numpy.ndarray
+            Validated boundaries or perturbation multipliers.
+
+        Returns
+        -------
+        numpy.ndarray
+            Read-only, contiguous float64 copy.
+        """
+        # The sampler may reuse its working arrays after construction.
+        stored = np.array(values, dtype=np.float64, order="C", copy=True)
+        stored.setflags(write=False)
+        return stored
+
+    @staticmethod
+    def _validate_boundaries(boundaries: np.ndarray) -> None:
+        """Validate the bounds of each recorded energy domain.
+
+        Parameters
+        ----------
+        boundaries : numpy.ndarray
+            Lower and upper energy bound of each domain.
+
+        Raises
+        ------
+        ValueError
+            If a bound is nonfinite, unordered within a pair, or has an invalid shape.
+        """
+        # Each domain needs finite lower and upper energy bounds in increasing order.
+        if boundaries.ndim != 2 or boundaries.shape[1] != 2:
+            raise ValueError("boundaries must have shape (n_domains, 2).")
+        if boundaries.shape[0] == 0:
+            raise ValueError("SamplingBlock requires at least one domain.")
+        if not np.all(np.isfinite(boundaries)):
+            raise ValueError("SamplingBlock boundaries must be finite.")
+        if np.any(boundaries[:, 0] >= boundaries[:, 1]):
+            raise ValueError("Every SamplingBlock boundary must satisfy start < end.")
 
     @staticmethod
     def _validate_state_array(
@@ -316,66 +329,131 @@ class SpectraEnsemble:
         reference: Optional[PhononSpectra] = None,
         auto_normalize_samples: bool = True,
     ) -> None:
-        """Store stochastic sample rows and a separate reference spectrum.
+        """Initialize a stochastic spectrum ensemble on a shared energy grid.
 
         Parameters
         ----------
-        energy_grid : np.ndarray
-            Energy coordinates of the associated spectrum.
-        density_matrix : np.ndarray
-            Stochastic densities arranged by sample and energy.
+        energy_grid : numpy.ndarray
+            Shared energy coordinates in eV.
+        density_matrix : numpy.ndarray
+            Spectral densities with samples as rows and energies as columns.
         generation : EnsembleGeneration
-            Configuration and provenance describing sample generation.
-        sample_lengths : np.ndarray
-            Lengths of the physical support of the individual sample rows.
-        sampling_blocks : Sequence[SamplingBlock]
-            Compact stochastic multiplier and topology records.
-        reference : Optional[PhononSpectra], optional
-            Separate unperturbed phonon spectrum.
-        auto_normalize_samples : bool, default=True
-            Whether samples are normalized on lazy reconstruction.
+            Sampling configuration and expected stochastic sample count.
+        sample_lengths : numpy.ndarray
+            Number of grid points belonging to each sample before padding.
+        sampling_blocks : sequence of SamplingBlock
+            Topology and perturbation records covering the stochastic rows.
+        reference : PhononSpectra or None, optional
+            Unperturbed spectrum stored separately from the stochastic rows.
+        auto_normalize_samples : bool, optional
+            Normalize spectra when reconstructing individual samples.
+            Default is True.
 
         Raises
         ------
         TypeError
-            If the input or required state violates the operation contract.
+            If the generation record or any sampling block has the wrong type.
         ValueError
-            If the input or required state violates the operation contract.
+            If the grid, matrix, sample lengths, or block coverage are invalid.
         """
-        if not isinstance(generation, EnsembleGeneration):
-            raise TypeError("generation must be an EnsembleGeneration instance.")
-
         blocks = tuple(sampling_blocks)
-        if any(not isinstance(block, SamplingBlock) for block in blocks):
-            raise TypeError(
-                "Every sampling_blocks entry must be a SamplingBlock instance."
-            )
+        self._validate_generation_metadata(generation, blocks)
 
         energy_grid = np.asarray(energy_grid, dtype=np.float64)
         density_matrix = np.asarray(density_matrix, dtype=np.float64)
         sample_lengths = np.asarray(sample_lengths, dtype=np.int64)
 
+        n_samples = generation.n_samples
+        self._validate_sample_arrays(
+            energy_grid, density_matrix, sample_lengths, n_samples,
+        )
+        self._validate_block_coverage(blocks, n_samples)
+
+        # Own the coordinate and length arrays while retaining the sampler's matrix.
+        self._energy_grid = np.ascontiguousarray(energy_grid).copy()
+        self._density_matrix = density_matrix
+        self._sample_lengths = np.ascontiguousarray(sample_lengths).copy()
+        self._sampling_blocks = blocks
+
+        self.reference = reference
+        self.generation = generation
+        self._auto_normalize_samples = bool(auto_normalize_samples)
+
+        # Build pandas views only when a caller requests them.
+        self._pdos_cache: Optional[pd.DataFrame] = None
+        self._sample_info_cache: Optional[pd.DataFrame] = None
+
+    @staticmethod
+    def _validate_generation_metadata(
+        generation: EnsembleGeneration,
+        blocks: Sequence[SamplingBlock],
+    ) -> None:
+        """Validate the types of the ensemble provenance records.
+
+        Parameters
+        ----------
+        generation : EnsembleGeneration
+            Record describing the stochastic ensemble.
+        blocks : sequence of SamplingBlock
+            Topology and perturbation records for the sample rows.
+
+        Raises
+        ------
+        TypeError
+            If the generation record or any sampling block has the wrong type.
+        """
+        if not isinstance(generation, EnsembleGeneration):
+            raise TypeError("generation must be an EnsembleGeneration instance.")
+
+        if any(not isinstance(block, SamplingBlock) for block in blocks):
+            raise TypeError(
+                "Every sampling_blocks entry must be a SamplingBlock instance."
+            )
+
+    @staticmethod
+    def _validate_sample_arrays(
+        energy_grid: np.ndarray,
+        density_matrix: np.ndarray,
+        sample_lengths: np.ndarray,
+        n_samples: int,
+    ) -> None:
+        """Validate the shared grid and its alignment with the sample arrays.
+
+        Parameters
+        ----------
+        energy_grid : numpy.ndarray
+            Shared energy coordinates in eV.
+        density_matrix : numpy.ndarray
+            Spectral densities with samples as rows and energies as columns.
+        sample_lengths : numpy.ndarray
+            Number of valid grid points in each sample row before padding.
+        n_samples : int
+            Expected number of stochastic samples.
+
+        Raises
+        ------
+        ValueError
+            If the grid is invalid or the arrays do not match the grid and
+            expected sample count.
+        """
+        # Every spectrum occupies a prefix of the same energy grid.
         if energy_grid.ndim != 1 or energy_grid.size < 2:
             raise ValueError("energy_grid must be one-dimensional with at least 2 points.")
         if not np.all(np.isfinite(energy_grid)):
             raise ValueError("energy_grid must contain only finite values.")
-        # Examine adjacent grid differences to enforce ordering or locate transitions.
         if np.any(energy_grid < 0.0) or np.any(np.diff(energy_grid) <= 0.0):
-            raise ValueError(
-                "energy_grid must be strictly increasing and non-negative."
-            )
+            raise ValueError("energy_grid must be strictly increasing and non-negative.")
 
+        # The matrix needs one row per sample and one column per grid point.
         if density_matrix.ndim != 2:
             raise ValueError("density_matrix must be two-dimensional.")
         if density_matrix.shape[1] != energy_grid.size:
-            raise ValueError(
-                "density_matrix column count must match energy_grid length."
-            )
-        if density_matrix.shape[0] != generation.n_samples:
-            raise ValueError(
-                "EnsembleGeneration.n_samples must match density_matrix rows."
-            )
-        if sample_lengths.ndim != 1 or sample_lengths.size != generation.n_samples:
+            raise ValueError("density_matrix column count must match energy_grid length.")
+        if density_matrix.shape[0] != n_samples:
+            raise ValueError("EnsembleGeneration.n_samples must match density_matrix rows.")
+
+        # Each length marks the end of the valid data in its padded row.
+        if sample_lengths.ndim != 1 or sample_lengths.size != n_samples:
             raise ValueError(
                 "sample_lengths must contain exactly one entry per ensemble sample."
             )
@@ -383,24 +461,6 @@ class SpectraEnsemble:
             raise ValueError(
                 "Every sample length must be between 2 and the canonical grid length."
             )
-
-        self._validate_block_coverage(blocks, generation.n_samples)
-
-        # The sampler hands ownership of its final matrix to the ensemble. Keep
-        # the numerical storage directly instead of rebuilding it through pandas.
-        self._energy_grid = np.ascontiguousarray(energy_grid).copy()
-        self._density_matrix = density_matrix
-        self._sample_lengths = np.ascontiguousarray(sample_lengths).copy()
-        self._sampling_blocks = blocks
-        # Keep the unperturbed baseline separate from the stochastic sample matrix.
-        self.reference = reference
-        self.generation = generation
-        self._auto_normalize_samples = bool(auto_normalize_samples)
-
-        # DataFrame views are intentionally lazy. The normal numerical pipeline
-        # therefore pays no pandas/object-allocation cost unless users request it.
-        self._pdos_cache: Optional[pd.DataFrame] = None
-        self._sample_info_cache: Optional[pd.DataFrame] = None
 
     @staticmethod
     def _validate_block_coverage(
@@ -488,8 +548,6 @@ class SpectraEnsemble:
             Ensemble density matrix using samples as rows and energies as columns.
         """
         if self._pdos_cache is None:
-            # Expose the full shared grid in the table. Per-sample support is tracked
-            # separately by sample length.
             sample_index = pd.Index(range(self.n_samples), name="Sample_Index")
             self._pdos_cache = pd.DataFrame(
                 self._density_matrix,

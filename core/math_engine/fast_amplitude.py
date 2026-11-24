@@ -55,12 +55,13 @@ class FastAmplitudePerturber:
         y_density : np.ndarray
             Spectral density sampled on the input grid.
         transition_points : int, optional
-            Domain transition coordinates requiring smoothed amplitude weights.
+            Number of points in each boundary blend. Default is 8.
 
         Raises
         ------
         ValueError
-            If the input or required state violates the operation contract.
+            If the arrays are incompatible, the grid is nonmonotonic, or the
+            transition uses fewer than two points.
         """
         self.x_grid = np.asarray(x_grid, dtype=np.float64)
         self.y_density = np.asarray(y_density, dtype=np.float64)
@@ -112,7 +113,7 @@ class FastAmplitudePerturber:
         Returns
         -------
         Tuple[Tuple[float, float], ...]
-            Calculated arrays or records in the order described by the operation.
+            Pairs of energy bounds in their original domain order.
         """
         return tuple((float(start), float(end)) for start, end in boundaries)
 
@@ -149,14 +150,29 @@ class FastAmplitudePerturber:
                 mask = (self.x_grid >= start) & (self.x_grid < end)
             weights[mask, domain_idx] = 1.0
 
+        self._blend_boundary_weights(weights, boundaries)
+        return weights
+
+    def _blend_boundary_weights(
+        self, weights: np.ndarray, boundaries: List[Tuple[float, float]],
+    ) -> None:
+        """Blend neighboring domain weights around each internal boundary.
+
+        Parameters
+        ----------
+        weights : numpy.ndarray
+            Grid-by-domain matrix to update in place.
+        boundaries : list of tuple of float
+            Lower and upper energy bounds of each domain in eV.
+        """
+        n_points, n_domains = weights.shape
         # Smooth only compact neighborhoods around internal boundaries.
         half_left = self.transition_points // 2
         half_right = self.transition_points - half_left
 
         for domain_idx in range(n_domains - 1):
             boundary = float(boundaries[domain_idx][1])
-            # Locate the relevant grid interval while preserving the ordering of the original
-            # coordinates.
+            # Center the blend on the first node at or above the boundary.
             center_idx = int(np.searchsorted(self.x_grid, boundary, side="left"))
 
             start_idx = max(0, center_idx - half_left)
@@ -175,8 +191,6 @@ class FastAmplitudePerturber:
             weights[start_idx:end_idx, domain_idx] = left_weight
             weights[start_idx:end_idx, domain_idx + 1] = right_weight
 
-        return weights
-
     def _get_weights(
         self,
         boundaries: List[Tuple[float, float]],
@@ -191,7 +205,7 @@ class FastAmplitudePerturber:
         Returns
         -------
         np.ndarray
-            Numerical array evaluated on the corresponding coordinate grid.
+            Cached grid-by-domain weight matrix.
         """
         key = self._cache_key(boundaries)
         weights = self._weight_cache.get(key)

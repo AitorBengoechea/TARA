@@ -11,7 +11,10 @@ from core.config import TaraConfig
 
 class CorrelationStrategy(ABC):
     """
-    Define how stochastic variables are distributed across energy domains.
+    Define how legacy uniform draws are shared across energy domains.
+
+    The public samplers use ParameterSpaceSampler to apply the same
+    correlation policies to either supported statistical design.
 
     Parameters
     ----------
@@ -131,7 +134,7 @@ class RandomGroupCorrelation(CorrelationStrategy):
 
 def get_correlation_strategy(config: TaraConfig) -> CorrelationStrategy:
     """
-    Initialize the configured correlation strategy.
+    Select the legacy Monte Carlo correlation strategy.
 
     Parameters
     ----------
